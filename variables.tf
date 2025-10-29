@@ -64,26 +64,8 @@ variable "include_management_account" {
   default     = true
 }
 
-variable "organization_access_role_name" {
-  description = "Name of the IAM role assumed within each member account (e.g., OrganizationAccountAccessRole)."
-  type        = string
-  default     = "OrganizationAccountAccessRole"
-}
-
-variable "assume_role_session_name" {
-  description = "Session name used when assuming into member accounts."
-  type        = string
-  default     = "terraform-drata-autopilot"
-}
-
 variable "target_region" {
   description = "AWS region to target when creating resources in member accounts."
-  type        = string
-  default     = null
-}
-
-variable "target_assume_role_external_id" {
-  description = "Optional external ID required to assume the member account access role."
   type        = string
   default     = null
 }

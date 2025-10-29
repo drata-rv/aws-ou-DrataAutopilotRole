@@ -3,12 +3,15 @@
 Terraform module that provisions the Drata Autopilot IAM role across every selected account in an AWS Organization. The module:
 
 - Enumerates organization accounts and filters them by OU, explicit ID lists, or account tags (e.g., `Environment = PROD`).
-- Deploys the same tightly-scoped IAM role to each targeted account and optionally to the management account running Terraform.
+- Deploys the same tightly-scoped IAM role to each targeted account using a service-managed CloudFormation StackSet, and optionally creates the role in the management account running Terraform.
 - Emits both a per-account ARN map and a single management-account ARN that Drata’s OU integration expects.
 
 This guide walks through usage from a beginner’s perspective—no existing Terraform project required.
 
-> **Note:** If you received this module as a zipped package, unzip it somewhere convenient and reference the extracted folder in the `module "drata_autopilot_role"` block shown below.
+> **Notes:**  
+> • If you received this module as a zipped package, unzip it somewhere convenient and reference the extracted folder in the `module "drata_autopilot_role"` block shown below.  
+> • Ensure CloudFormation StackSets has trusted access enabled with AWS Organizations before running Terraform (`aws organizations enable-aws-service-access --service-principal stacksets.cloudformation.amazonaws.com`).  
+> • The module shells out to the AWS CLI (via Python) to enumerate organization accounts, so Terraform must run in an environment where the CLI is installed and authenticated.
 
 ---
 
@@ -16,13 +19,16 @@ This guide walks through usage from a beginner’s perspective—no existing Ter
 
 Make sure you have:
 
-1. **Terraform CLI ≥ 1.3** – download from [terraform.io/downloads](https://developer.hashicorp.com/terraform/downloads).
-2. **AWS CLI** configured with credentials for the **management account** (a profile or environment variables that let you run `aws sts get-caller-identity` successfully).
-3. The management account permissions:
-   - `organizations:DescribeOrganization`, `organizations:ListAccounts`, `organizations:ListTagsForResource`
+1. **Terraform CLI ≥ 1.3** (validated with 1.13.x) – download from [terraform.io/downloads](https://developer.hashicorp.com/terraform/downloads).
+2. **AWS provider 5.x** – the module pins `< 6.0` because AWS provider v6 dropped the Organizations account listing data sources used for filtering.
+3. **AWS CLI** configured with credentials for the **management account** (a profile or environment variables that let you run `aws sts get-caller-identity` successfully).
+4. **Python 3.x** available in your shell (used by the module’s helper script that enumerates accounts via the AWS CLI).
+5. The management account permissions:
+   - `organizations:DescribeOrganization`, `organizations:ListAccounts`, `organizations:ListTagsForResource`, `organizations:ListParents`
    - `sts:AssumeRole` into the member account access role (default `OrganizationAccountAccessRole`)
    - IAM permissions to create roles/policies if deploying to the management account.
-4. (Recommended) Organization accounts tagged with something like `Environment = PROD|DEV|TEST` if you want tag-based filtering.
+6. **CloudFormation StackSets trusted access enabled** for your organization (one-time setup: `aws organizations enable-aws-service-access --service-principal stacksets.cloudformation.amazonaws.com`).
+7. (Recommended) Organization accounts tagged with something like `Environment = PROD|DEV|TEST` if you want tag-based filtering.
 
 ---
 
@@ -48,7 +54,11 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = ">= 5.0"
+      version = ">= 5.0, < 6.0"
+    }
+    external = {
+      source  = "hashicorp/external"
+      version = ">= 2.3"
     }
   }
 }
@@ -71,10 +81,7 @@ module "drata_autopilot_role" {
   # exclude_account_ids = ["999999999999"]
 
   include_management_account    = true
-  organization_access_role_name = "OrganizationAccountAccessRole"
-  assume_role_session_name      = "terraform-drata-autopilot"
   # target_region               = "us-west-2" # defaults to provider region when omitted
-  target_assume_role_external_id = null
 
   role_name        = "DrataAutopilotRole"
   role_description = "Cross-account read-only access for Drata Autopilot"
@@ -134,7 +141,7 @@ Type `yes` when you are satisfied with the plan. Terraform will create the IAM r
 
 ### Step 7 – Grab the ARNs
 
-When the apply completes, capture the `drata_role_arn` output for Drata’s connection panel and keep the `management_role_arn` / `member_role_arns` handy for validation or downstream automation.
+When the apply completes, capture the `drata_role_arn` output for Drata’s connection panel and keep the `management_role_arn` / `member_role_arns` handy for validation or downstream automation. StackSet deployments may take a few minutes; monitor progress in AWS CloudFormation → StackSets if you need to troubleshoot per-account rollouts.
 
 ---
 
@@ -190,10 +197,7 @@ For sensitive values, consider `terraform.tfvars` combined with a `.gitignore`, 
 | `include_account_ids` | list(string) | `[]` | Allow-list specific accounts (in addition to OU/tag filters). |
 | `exclude_account_ids` | list(string) | `[]` | Remove specific accounts after other filters. |
 | `include_management_account` | bool | `true` | Create the role in the management account. Set to `false` if Drata should never assume into it. |
-| `organization_access_role_name` | string | `OrganizationAccountAccessRole` | Intermediate role Terraform assumes inside each member account. Change if your organization uses a different name. |
-| `target_region` | string | `null` | Region used by the assumed provider. Defaults to the caller’s AWS provider region when omitted. |
-| `target_assume_role_external_id` | string | `null` | External ID required to assume the intermediate role, if your org enforces one. |
-| `assume_role_session_name` | string | `terraform-drata-autopilot` | STS session name used while assuming member accounts. |
+| `target_region` | string | `null` | Region where the StackSet instances are deployed. Defaults to the caller’s AWS provider region when omitted. |
 | `role_name` / `role_description` / `role_path` | string | Defaults in `variables.tf` | IAM metadata for the created role. |
 | `tags` | map(string) | `{}` | Tags applied to the role and inline policy in every account. |
 
@@ -216,7 +220,7 @@ Use `drata_role_arn` for Drata’s setup wizard. The remaining outputs help with
 1. Queries AWS Organizations for every account and its tags.
 2. Applies OU, tag, and explicit account filters to determine the deployment set.
 3. Optionally creates the IAM role in the management account (same policy surface as the original single-account module).
-4. For each member account, assumes the `organization_access_role_name` via STS and creates the role + policy attachments there.
+4. Creates a service-managed CloudFormation StackSet that provisions the IAM role, SecurityAudit attachment, and inline policy into every targeted member account.
 5. Returns a map of ARNs for Drata.
 
 IAM permissions remain tightly scoped: the module only attaches the AWS managed `SecurityAudit` policy plus a short Drata-specific inline policy (`backup:ListBackupJobs`, `backup:ListRecoveryPointsByResource`).
@@ -226,7 +230,7 @@ IAM permissions remain tightly scoped: the module only attaches the AWS managed 
 ## 8. Troubleshooting Tips
 
 - **AccessDenied when listing accounts** – confirm your management-account credentials have the Organizations permissions listed in the prerequisites.
-- **AssumeRole fails for member accounts** – ensure every account has the intermediate role (`OrganizationAccountAccessRole` by default) and that your caller is allowed to assume it (IAM trust policy + optional external ID).
+- **StackSet instance failures** – confirm CloudFormation StackSets trusted access is enabled and review the StackSet operation detail for failed accounts (common causes are service control policies or pre-existing roles with the same name).
 - **Unexpected accounts targeted** – run `terraform plan` and inspect the module keys. Adjust `target_parent_ids`, tag filters, or include/exclude lists accordingly.
 - **Region concerns** – the module inherits the region from your provider block unless `target_region` is explicitly set. IAM is global, so the choice primarily impacts STS calls; pick any supported region.
 

@@ -13,6 +13,6 @@ output "drata_role_arn" {
 }
 
 output "member_role_arns" {
-  value       = { for account_id, module_data in module.member_roles : account_id => module_data.role_arn }
+  value       = local.member_role_arns
   description = "Map of account ID to role ARN for each member account."
 }

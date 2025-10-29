@@ -1,22 +1,66 @@
-terraform {
-  required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = ">= 5.0"
-    }
-  }
-}
-
 data "aws_caller_identity" "current" {}
 
 data "aws_organizations_organization" "org" {}
 
-data "aws_organizations_accounts" "all" {}
-
 data "aws_region" "current" {}
 
+# External helper pulls organization accounts (with parent OU IDs) using the AWS CLI
+# because the AWS provider no longer exposes a dedicated data source for this.
+data "external" "organization_accounts" {
+  program = [
+    "bash",
+    "-lc",
+    <<-SCRIPT
+set -euo pipefail
+python3 - <<'PY'
+import json
+import subprocess
+import sys
+
+def aws_json(args):
+    cmd = ["aws"] + args + ["--output", "json"]
+    try:
+        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as exc:
+        sys.stderr.write(exc.stderr or "")
+        sys.exit(exc.returncode)
+    return json.loads(proc.stdout or "{}")
+
+accounts_data = aws_json(["organizations", "list-accounts"])
+accounts = accounts_data.get("Accounts", [])
+results = []
+for account in accounts:
+    parents = aws_json(["organizations", "list-parents", "--child-id", account.get("Id", "")])
+    parent_entries = parents.get("Parents", [])
+    parent_id = parent_entries[0].get("Id") if parent_entries else None
+    results.append(
+        {
+            "id": account.get("Id"),
+            "name": account.get("Name"),
+            "arn": account.get("Arn"),
+            "parent_id": parent_id,
+        }
+    )
+
+print(json.dumps({"accounts": results}))
+PY
+SCRIPT
+  ]
+}
+
+locals {
+  raw_accounts = [
+    for account in try(data.external.organization_accounts.result.accounts, []) : {
+      id        = account["id"]
+      name      = account["name"]
+      arn       = account["arn"]
+      parent_id = try(account["parent_id"], null)
+    }
+  ]
+}
+
 data "aws_organizations_resource_tags" "account_tags" {
-  for_each    = { for account in data.aws_organizations_accounts.all.accounts : account.id => account.arn }
+  for_each    = { for account in local.raw_accounts : account.id => account.arn }
   resource_id = each.value
 }
 
@@ -25,14 +69,19 @@ locals {
   organization_root_ids = [for root in data.aws_organizations_organization.org.roots : root.id]
   scoped_parent_ids     = length(var.target_parent_ids) > 0 ? var.target_parent_ids : local.organization_root_ids
 
+  account_tags_map = {
+    for account_id, tags_data in data.aws_organizations_resource_tags.account_tags :
+    account_id => try(tags_data.tags, {})
+  }
+
   discovered_accounts = {
-    for account in data.aws_organizations_accounts.all.accounts :
+    for account in local.raw_accounts :
     account.id => {
       id        = account.id
       name      = account.name
       arn       = account.arn
-      parent_id = try(account.parent_id, null)
-      tags      = try(data.aws_organizations_resource_tags.account_tags[account.id].tags, {})
+      parent_id = account.parent_id
+      tags      = lookup(local.account_tags_map, account.id, {})
     }
   }
 
@@ -84,7 +133,78 @@ locals {
     id => account if id != local.management_account_id
   }
 
-  effective_target_region = coalesce(var.target_region, data.aws_region.current.name)
+  effective_target_region = coalesce(var.target_region, data.aws_region.current.id)
+
+  drata_assume_role_statement = merge(
+    {
+      Effect = "Allow"
+      Principal = {
+        AWS = var.drata_aws_account_arn
+      }
+      Action = ["sts:AssumeRole"]
+    },
+    var.role_sts_externalid == null ? {} : {
+      Condition = {
+        StringEquals = {
+          "sts:ExternalId" = var.role_sts_externalid
+        }
+      }
+    }
+  )
+
+  role_tags_list = [
+    for tag_key, tag_value in var.tags : {
+      Key   = tag_key
+      Value = tag_value
+    }
+  ]
+
+  stack_set_name = "${var.role_name}-stackset"
+
+  member_role_arns = {
+    for account_id, _ in local.member_accounts :
+    account_id => "arn:aws:iam::${account_id}:role/${var.role_name}"
+  }
+
+  stack_set_template_body = jsonencode({
+    AWSTemplateFormatVersion = "2010-09-09"
+    Description              = "Drata Autopilot IAM role deployed across member accounts."
+    Resources = {
+      DrataAutopilotRole = {
+        Type = "AWS::IAM::Role"
+        Properties = merge({
+          RoleName    = var.role_name
+          Description = var.role_description
+          Path        = var.role_path
+          AssumeRolePolicyDocument = {
+            Version   = "2012-10-17"
+            Statement = [local.drata_assume_role_statement]
+          }
+          ManagedPolicyArns = [
+            "arn:aws:iam::aws:policy/SecurityAudit"
+          ]
+          Policies = [
+            {
+              PolicyName = "DrataAdditionalPermissions"
+              PolicyDocument = {
+                Version = "2012-10-17"
+                Statement = [
+                  {
+                    Effect = "Allow"
+                    Action = [
+                      "backup:ListBackupJobs",
+                      "backup:ListRecoveryPointsByResource"
+                    ]
+                    Resource = "*"
+                  }
+                ]
+              }
+            }
+          ]
+        }, length(local.role_tags_list) > 0 ? { Tags = local.role_tags_list } : {})
+      }
+    }
+  })
 }
 
 data "aws_iam_policy_document" "drata_autopilot_assume_role" {
@@ -157,19 +277,25 @@ resource "aws_iam_role_policy_attachment" "management_additional_permissions" {
   policy_arn = aws_iam_policy.drata_additional_permissions[0].arn
 }
 
-module "member_roles" {
-  for_each = local.member_accounts
-  source   = "./modules/member_role"
+# StackSet rolls the IAM role out to every selected member account. Requires trusted
+# access for CloudFormation StackSets (AWS Organizations).
+resource "aws_cloudformation_stack_set" "member_role" {
+  name             = local.stack_set_name
+  permission_model = "SERVICE_MANAGED"
+  capabilities     = ["CAPABILITY_NAMED_IAM"]
+  call_as          = "SELF"
 
-  account_id                     = each.value.id
-  organization_access_role_name  = var.organization_access_role_name
-  target_assume_role_external_id = var.target_assume_role_external_id
-  assume_role_session_name       = var.assume_role_session_name
-  target_region                  = local.effective_target_region
-  drata_aws_account_arn          = var.drata_aws_account_arn
-  role_sts_externalid            = var.role_sts_externalid
-  role_name                      = var.role_name
-  role_path                      = var.role_path
-  role_description               = var.role_description
-  tags                           = var.tags
+  template_body = local.stack_set_template_body
+  tags          = var.tags
+}
+
+resource "aws_cloudformation_stack_set_instance" "member" {
+  for_each = local.member_accounts
+
+  stack_set_name = aws_cloudformation_stack_set.member_role.name
+  region         = local.effective_target_region
+
+  deployment_targets {
+    accounts = [each.key]
+  }
 }
