@@ -42,7 +42,7 @@ for account in accounts:
         }
     )
 
-print(json.dumps({"accounts": results}))
+print(json.dumps({"accounts_json": json.dumps(results)}))
 PY
 SCRIPT
   ]
@@ -50,7 +50,7 @@ SCRIPT
 
 locals {
   raw_accounts = [
-    for account in try(data.external.organization_accounts.result.accounts, []) : {
+    for account in try(jsondecode(data.external.organization_accounts.result.accounts_json), []) : {
       id        = account["id"]
       name      = account["name"]
       arn       = account["arn"]
