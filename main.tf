@@ -9,7 +9,7 @@ data "aws_region" "current" {}
 data "external" "organization_accounts" {
   program = [
     "bash",
-    "-lc",
+    "-c",
     <<-SCRIPT
 set -euo pipefail
 python3 - <<'PY'
