@@ -42,7 +42,15 @@ for account in accounts:
         }
     )
 
-print(json.dumps({"accounts_json": json.dumps(results)}))
+# Flatten for Terraform external data source
+flat_output = {}
+for i, account in enumerate(results):
+    flat_output[f"id_{i}"] = account.get("id", "")
+    flat_output[f"name_{i}"] = account.get("name", "")
+    flat_output[f"arn_{i}"] = account.get("arn", "")
+    flat_output[f"parent_id_{i}"] = account.get("parent_id", "")
+
+print(json.dumps(flat_output))
 PY
 SCRIPT
   ]
@@ -50,7 +58,7 @@ SCRIPT
 
 locals {
   raw_accounts = [
-    for account in try(jsondecode(data.external.organization_accounts.result.accounts_json), []) : {
+    for account in try(data.external.organization_accounts.result.accounts, []) : {
       id        = account["id"]
       name      = account["name"]
       arn       = account["arn"]
@@ -287,6 +295,11 @@ resource "aws_cloudformation_stack_set" "member_role" {
 
   template_body = local.stack_set_template_body
   tags          = var.tags
+
+  auto_deployment {
+    enabled                        = true
+    retain_stacks_on_account_removal = false
+  }
 }
 
 resource "aws_cloudformation_stack_set_instance" "member" {
