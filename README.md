@@ -20,7 +20,7 @@ This guide walks through usage from a beginner’s perspective—no existing Ter
 Make sure you have:
 
 1. **Terraform CLI ≥ 1.3** (validated with 1.13.x) – download from [terraform.io/downloads](https://developer.hashicorp.com/terraform/downloads).
-2. **AWS provider 5.x** – the module pins `< 6.0` because AWS provider v6 dropped the Organizations account listing data sources used for filtering.
+2. **AWS provider 5.x** – the module pins `< 6.0` as a conservative compatibility bound; account enumeration itself is done via an `external` data source shelling out to the AWS CLI (not a native provider data source), since the AWS provider has never exposed one for listing Organizations accounts.
 3. **AWS CLI** configured with credentials for the **management account** (a profile or environment variables that let you run `aws sts get-caller-identity` successfully).
 4. **Python 3.x** available in your shell (used by the module’s helper script that enumerates accounts via the AWS CLI).
 5. The management account permissions:
@@ -45,7 +45,7 @@ cd drata-autopilot-setup
 
 ### Step 2 – Create `main.tf`
 
-Paste the following, adjusting the module `source` path to wherever you unzipped this package (or to a registry/Git source if you are consuming a published release).
+Paste the following, adjusting the module `source` path to wherever you unzipped this package (or to a registry/Git source if you are consuming a published release). The example below assumes the unzipped module folder is a sibling of `drata-autopilot-setup` (i.e. `source = "../terraform-aws-drata-autopilot-role"` resolves one directory up) — if you placed it elsewhere, adjust the relative path accordingly.
 
 ```hcl
 terraform {
@@ -191,10 +191,10 @@ For sensitive values, consider `terraform.tfvars` combined with a `.gitignore`, 
 | Variable | Type | Default | Description |
 |----------|------|---------|-------------|
 | `drata_aws_account_arn` | string | `arn:aws:iam::269135526815:root` | Drata principal allowed to assume the role. Override only if Drata instructs you. |
-| `role_sts_externalid` | string | `null` | External ID Drata requires when assuming the role. Almost always mandatory. |
-| `target_parent_ids` | list(string) | `[]` | OU IDs you want to include. Empty = organization root. |
+| `role_sts_externalid` | string | `null` | External ID Drata requires when assuming the role. **Required** — `terraform plan` fails validation if left unset, since deploying without it leaves the org-wide trust policy with no ExternalId condition. |
+| `target_parent_ids` | list(string) | `[]` | Root ID(s) (`r-xxxx`) or OU ID(s) (`ou-xxxx-xxxxxxxx`) you want to include. Matches accounts nested at **any depth** beneath the given parent(s) — not just direct children. Empty = organization root (all accounts). |
 | `account_tag_filters` | map(list(string)) | `{}` | Filter accounts by tag (e.g. `{ Environment = ["PROD"] }`). All tag conditions must match. |
-| `include_account_ids` | list(string) | `[]` | Allow-list specific accounts (in addition to OU/tag filters). |
+| `include_account_ids` | list(string) | `[]` | Optional allow-list that **narrows** the set already scoped by `target_parent_ids`/`account_tag_filters` down to only these account IDs. This is an AND, not an OR — it cannot pull in an account from outside your OU/tag scope. |
 | `exclude_account_ids` | list(string) | `[]` | Remove specific accounts after other filters. |
 | `include_management_account` | bool | `true` | Create the role in the management account. Set to `false` if Drata should never assume into it. |
 | `target_region` | string | `null` | Region where the StackSet instances are deployed. Defaults to the caller’s AWS provider region when omitted. |
@@ -231,7 +231,8 @@ IAM permissions remain tightly scoped: the module only attaches the AWS managed 
 
 - **AccessDenied when listing accounts** – confirm your management-account credentials have the Organizations permissions listed in the prerequisites.
 - **StackSet instance failures** – confirm CloudFormation StackSets trusted access is enabled and review the StackSet operation detail for failed accounts (common causes are service control policies or pre-existing roles with the same name).
-- **Unexpected accounts targeted** – run `terraform plan` and inspect the module keys. Adjust `target_parent_ids`, tag filters, or include/exclude lists accordingly.
+- **Unexpected accounts targeted** – run `terraform plan` and inspect the module keys. Adjust `target_parent_ids`, tag filters, or include/exclude lists accordingly. Remember `include_account_ids` only narrows an already-scoped set (see Section 5) — it will not add an account that falls outside `target_parent_ids`.
+- **Invalid value for variable errors on `terraform plan`** – account IDs must be 12-digit strings, OU IDs must look like `ou-xxxx-xxxxxxxx` (or `r-xxxx` for a root), and `role_sts_externalid` must be set. These are enforced by variable validation so mistakes surface immediately instead of silently matching zero accounts.
 - **Region concerns** – the module inherits the region from your provider block unless `target_region` is explicitly set. IAM is global, so the choice primarily impacts STS calls; pick any supported region.
 
 ---

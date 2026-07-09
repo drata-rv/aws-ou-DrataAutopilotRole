@@ -4,8 +4,12 @@ data "aws_organizations_organization" "org" {}
 
 data "aws_region" "current" {}
 
-# External helper pulls organization accounts (with parent OU IDs) using the AWS CLI
-# because the AWS provider no longer exposes a dedicated data source for this.
+# External helper walks the AWS Organizations OU tree (via the AWS CLI) because the AWS
+# provider no longer exposes a dedicated data source for this. Walking top-down via
+# list-organizational-units-for-parent / list-accounts-for-parent (rather than calling
+# list-parents once per account) keeps API call volume proportional to the number of OUs
+# rather than the number of accounts, and yields each account's full ancestor OU chain so
+# target_parent_ids can match accounts nested at any depth, not just direct children.
 data "external" "organization_accounts" {
   program = [
     "bash",
@@ -14,35 +18,74 @@ data "external" "organization_accounts" {
 set -euo pipefail
 python3 - <<'PY'
 import json
+import os
+import random
 import subprocess
 import sys
+import time
 
-def aws_json(args):
+# Defense in depth: lean on the CLI/SDK's own adaptive retry in addition to our
+# explicit backoff below, in case throttling happens deeper inside a single call
+# (e.g. mid-pagination) than our retry loop can see.
+os.environ.setdefault("AWS_RETRY_MODE", "adaptive")
+os.environ.setdefault("AWS_MAX_ATTEMPTS", "10")
+
+
+def aws_json(args, max_attempts=8):
     cmd = ["aws"] + args + ["--output", "json"]
-    try:
-        proc = subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as exc:
-        sys.stderr.write(exc.stderr or "")
-        sys.exit(exc.returncode)
-    return json.loads(proc.stdout or "{}")
+    for attempt in range(1, max_attempts + 1):
+        proc = subprocess.run(cmd, capture_output=True, text=True)
+        if proc.returncode == 0:
+            return json.loads(proc.stdout or "{}")
+        stderr = proc.stderr or ""
+        throttled = any(
+            marker in stderr
+            for marker in ("Throttling", "TooManyRequestsException", "RequestLimitExceeded")
+        )
+        if throttled and attempt < max_attempts:
+            time.sleep(min(2 ** attempt, 30) + random.uniform(0, 1))
+            continue
+        sys.stderr.write(stderr)
+        sys.exit(proc.returncode or 1)
+    return {}
 
-accounts_data = aws_json(["organizations", "list-accounts"])
-accounts = accounts_data.get("Accounts", [])
-results = []
+
+ou_parent = {}
+accounts = []
+
+
+def walk(parent_id):
+    for account in aws_json(["organizations", "list-accounts-for-parent", "--parent-id", parent_id]).get("Accounts", []):
+        accounts.append(
+            {
+                "id": account.get("Id"),
+                "name": account.get("Name"),
+                "arn": account.get("Arn"),
+                "parent_id": parent_id,
+            }
+        )
+    for ou in aws_json(["organizations", "list-organizational-units-for-parent", "--parent-id", parent_id]).get("OrganizationalUnits", []):
+        ou_id = ou.get("Id")
+        ou_parent[ou_id] = parent_id
+        walk(ou_id)
+
+
+def ancestor_chain(parent_id):
+    chain = [parent_id]
+    current = parent_id
+    while current in ou_parent:
+        current = ou_parent[current]
+        chain.append(current)
+    return chain
+
+
+for root in aws_json(["organizations", "list-roots"]).get("Roots", []):
+    walk(root.get("Id"))
+
 for account in accounts:
-    parents = aws_json(["organizations", "list-parents", "--child-id", account.get("Id", "")])
-    parent_entries = parents.get("Parents", [])
-    parent_id = parent_entries[0].get("Id") if parent_entries else None
-    results.append(
-        {
-            "id": account.get("Id"),
-            "name": account.get("Name"),
-            "arn": account.get("Arn"),
-            "parent_id": parent_id,
-        }
-    )
+    account["ancestor_ids"] = ancestor_chain(account["parent_id"])
 
-print(json.dumps({"accounts_json": json.dumps(results)}))
+print(json.dumps({"accounts_json": json.dumps(accounts)}))
 PY
 SCRIPT
   ]
@@ -51,10 +94,11 @@ SCRIPT
 locals {
   raw_accounts = [
     for account in try(jsondecode(data.external.organization_accounts.result.accounts_json), []) : {
-      id        = account["id"]
-      name      = account["name"]
-      arn       = account["arn"]
-      parent_id = try(account["parent_id"], null)
+      id           = account["id"]
+      name         = account["name"]
+      arn          = account["arn"]
+      parent_id    = try(account["parent_id"], null)
+      ancestor_ids = try(account["ancestor_ids"], [])
     }
   ]
 }
@@ -77,22 +121,22 @@ locals {
   discovered_accounts = {
     for account in local.raw_accounts :
     account.id => {
-      id        = account.id
-      name      = account.name
-      arn       = account.arn
-      parent_id = account.parent_id
-      tags      = lookup(local.account_tags_map, account.id, {})
+      id           = account.id
+      name         = account.name
+      arn          = account.arn
+      parent_id    = account.parent_id
+      ancestor_ids = account.ancestor_ids
+      tags         = lookup(local.account_tags_map, account.id, {})
     }
   }
 
+  # An account matches if ANY OU in its ancestor chain (immediate parent up through
+  # the organization root) is in scope - so target_parent_ids selects accounts nested
+  # at any depth beneath the given OU(s), not just its direct children.
   parent_filtered_accounts = {
     for id, account in local.discovered_accounts :
     id => account
-    if(
-      account.parent_id != null && length(local.scoped_parent_ids) > 0 ?
-      contains(local.scoped_parent_ids, account.parent_id) :
-      contains(local.scoped_parent_ids, local.organization_root_ids[0])
-    )
+    if length(setintersection(toset(account.ancestor_ids), toset(local.scoped_parent_ids))) > 0
   }
 
   include_filtered_accounts = length(var.include_account_ids) > 0 ? {
@@ -113,23 +157,11 @@ locals {
     ])
   }
 
-  management_account_metadata = lookup(local.discovered_accounts, local.management_account_id, {
-    id        = local.management_account_id
-    name      = "management"
-    arn       = "arn:aws:iam::${local.management_account_id}:root"
-    parent_id = local.organization_root_ids[0]
-    tags      = {}
-  })
-
-  selected_accounts = var.include_management_account ? merge(
-    local.tag_filtered_accounts,
-    {
-      (local.management_account_id) = local.management_account_metadata
-    }
-  ) : local.tag_filtered_accounts
-
+  # The management account never receives its role via the StackSet path - it's
+  # provisioned separately below (aws_iam_role.management), gated by the same
+  # var.include_management_account - so it's always excluded here regardless.
   member_accounts = {
-    for id, account in local.selected_accounts :
+    for id, account in local.tag_filtered_accounts :
     id => account if id != local.management_account_id
   }
 
@@ -163,7 +195,7 @@ locals {
 
   member_role_arns = {
     for account_id, _ in local.member_accounts :
-    account_id => "arn:aws:iam::${account_id}:role/${var.role_name}"
+    account_id => "arn:aws:iam::${account_id}:role${var.role_path}${var.role_name}"
   }
 
   stack_set_template_body = jsonencode({
@@ -287,6 +319,16 @@ resource "aws_cloudformation_stack_set" "member_role" {
 
   template_body = local.stack_set_template_body
   tags          = var.tags
+
+  lifecycle {
+    precondition {
+      condition = contains(
+        data.aws_organizations_organization.org.aws_service_access_principals,
+        "member.org.stacksets.cloudformation.amazonaws.com"
+      )
+      error_message = "CloudFormation StackSets trusted access is not enabled for this AWS Organization. Enable it first (from the management account): aws organizations enable-aws-service-access --service-principal=member.org.stacksets.cloudformation.amazonaws.com"
+    }
+  }
 }
 
 resource "aws_cloudformation_stack_set_instance" "member" {
