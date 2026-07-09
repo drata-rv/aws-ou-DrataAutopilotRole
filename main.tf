@@ -61,7 +61,7 @@ locals {
 
 data "aws_organizations_resource_tags" "account_tags" {
   for_each    = { for account in local.raw_accounts : account.id => account.arn }
-  resource_id = each.value
+  resource_id = each.key
 }
 
 locals {
