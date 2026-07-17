@@ -165,7 +165,7 @@ locals {
     id => account if id != local.management_account_id
   }
 
-  effective_target_region = coalesce(var.target_region, data.aws_region.current.id)
+  effective_target_region = coalesce(var.target_region, data.aws_region.current.region)
 
   drata_assume_role_statement = merge(
     {
@@ -344,10 +344,16 @@ resource "aws_cloudformation_stack_set" "member_role" {
 resource "aws_cloudformation_stack_set_instance" "member" {
   for_each = local.member_accounts
 
-  stack_set_name = aws_cloudformation_stack_set.member_role.name
-  region         = local.effective_target_region
+  stack_set_name            = aws_cloudformation_stack_set.member_role.name
+  stack_set_instance_region = local.effective_target_region
 
+  # AWS's documented pattern for targeting specific accounts under SERVICE_MANAGED
+  # never uses "accounts" alone - it pairs an OU/root with account_filter_type =
+  # INTERSECTION. Root always contains every account regardless of nesting depth,
+  # so this reliably resolves to exactly the one account in each.key.
   deployment_targets {
-    accounts = [each.key]
+    organizational_unit_ids = [local.organization_root_ids[0]]
+    account_filter_type     = "INTERSECTION"
+    accounts                = [each.key]
   }
 }
