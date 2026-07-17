@@ -317,6 +317,16 @@ resource "aws_cloudformation_stack_set" "member_role" {
   capabilities     = ["CAPABILITY_NAMED_IAM"]
   call_as          = "SELF"
 
+  # Required by AWS whenever permission_model = SERVICE_MANAGED (CreateStackSet
+  # rejects the request otherwise: "AutoDeployment is required"). Disabled because
+  # this module targets accounts explicitly via its own include/exclude/tag filters
+  # and per-account aws_cloudformation_stack_set_instance resources below - enabling
+  # AWS's native auto-deployment would let it silently expand the role to every
+  # account in a target OU, bypassing that scoping entirely.
+  auto_deployment {
+    enabled = false
+  }
+
   template_body = local.stack_set_template_body
   tags          = var.tags
 
