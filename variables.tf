@@ -2,15 +2,21 @@ variable "drata_aws_account_arn" {
   type        = string
   default     = "arn:aws:iam::269135526815:root"
   description = "Drata's AWS account ARN"
+
+  validation {
+    condition     = can(regex("^arn:aws[a-zA-Z-]*:iam::\\d{12}:root$", var.drata_aws_account_arn))
+    error_message = "drata_aws_account_arn must be an account root ARN of the form arn:aws:iam::<12-digit-account-id>:root."
+  }
 }
 
 variable "role_sts_externalid" {
   description = "STS ExternalId condition value to use with the role. Required: obtain this from your Drata AWS connection setup. Without it, the trust policy has no ExternalId condition at all, which is a classic cross-account confused-deputy risk given this role is deployed org-wide."
   type        = string
-  default     = null
+  nullable    = false
+  sensitive   = true
 
   validation {
-    condition     = var.role_sts_externalid != null && length(var.role_sts_externalid) > 0
+    condition     = length(trimspace(var.role_sts_externalid)) > 0
     error_message = "role_sts_externalid must be set to a non-empty value from your Drata AWS connection setup."
   }
 }
@@ -19,6 +25,13 @@ variable "role_name" {
   description = "IAM role name"
   type        = string
   default     = "DrataAutopilotRole"
+
+  validation {
+    # Intersection of IAM role naming rules and CloudFormation StackSet naming rules
+    # (stricter of the two) - the StackSet name is derived from this value.
+    condition     = can(regex("^[a-zA-Z][a-zA-Z0-9-]{0,127}$", var.role_name))
+    error_message = "role_name must start with a letter and contain only letters, digits, and hyphens (this becomes part of the CloudFormation StackSet name, which is stricter than IAM role naming rules)."
+  }
 }
 
 variable "role_path" {
@@ -66,6 +79,11 @@ variable "include_account_ids" {
     condition     = alltrue([for id in var.include_account_ids : can(regex("^\\d{12}$", id))])
     error_message = "Each entry in include_account_ids must be a 12-digit AWS account ID string (e.g. \"123456789012\")."
   }
+
+  validation {
+    condition     = length(var.include_account_ids) == length(distinct(var.include_account_ids))
+    error_message = "include_account_ids contains duplicate account IDs."
+  }
 }
 
 variable "exclude_account_ids" {
@@ -77,6 +95,16 @@ variable "exclude_account_ids" {
     condition     = alltrue([for id in var.exclude_account_ids : can(regex("^\\d{12}$", id))])
     error_message = "Each entry in exclude_account_ids must be a 12-digit AWS account ID string (e.g. \"123456789012\")."
   }
+
+  validation {
+    condition     = length(var.exclude_account_ids) == length(distinct(var.exclude_account_ids))
+    error_message = "exclude_account_ids contains duplicate account IDs."
+  }
+
+  validation {
+    condition     = length(setintersection(toset(var.include_account_ids), toset(var.exclude_account_ids))) == 0
+    error_message = "An account ID cannot appear in both include_account_ids and exclude_account_ids."
+  }
 }
 
 variable "account_tag_filters" {
@@ -87,6 +115,11 @@ variable "account_tag_filters" {
   validation {
     condition     = alltrue([for key, values in var.account_tag_filters : length(values) > 0])
     error_message = "Each key in account_tag_filters must map to a non-empty list of allowed values - an empty list would silently match zero accounts."
+  }
+
+  validation {
+    condition     = alltrue([for key, values in var.account_tag_filters : !contains(values, "")])
+    error_message = "account_tag_filters values cannot include an empty string - an empty string is reserved internally to mean \"this account doesn't have the tag\", so allowing it as a match value would let accounts without the tag match unintentionally."
   }
 }
 
@@ -100,4 +133,10 @@ variable "target_region" {
   description = "AWS region to target when creating resources in member accounts."
   type        = string
   default     = null
+}
+
+variable "confirm_organization_wide_deployment" {
+  description = "Required explicit opt-in when target_parent_ids is left empty, since that deploys the role to every account in the entire AWS Organization. Has no effect when target_parent_ids is set."
+  type        = bool
+  default     = false
 }

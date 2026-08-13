@@ -4,91 +4,20 @@ data "aws_organizations_organization" "org" {}
 
 data "aws_region" "current" {}
 
+data "aws_partition" "current" {}
+
 # External helper walks the AWS Organizations OU tree (via the AWS CLI) because the AWS
-# provider no longer exposes a dedicated data source for this. Walking top-down via
-# list-organizational-units-for-parent / list-accounts-for-parent (rather than calling
-# list-parents once per account) keeps API call volume proportional to the number of OUs
-# rather than the number of accounts, and yields each account's full ancestor OU chain so
-# target_parent_ids can match accounts nested at any depth, not just direct children.
+# provider no longer exposes a dedicated data source for this. See scripts/discover_accounts.py
+# for the full discovery logic (OU-tree walk, active-account filtering, retry/backoff).
 data "external" "organization_accounts" {
-  program = [
-    "bash",
-    "-c",
-    <<-SCRIPT
-set -euo pipefail
-python3 - <<'PY'
-import json
-import os
-import random
-import subprocess
-import sys
-import time
+  program = ["python3", "${path.module}/scripts/discover_accounts.py"]
 
-# Defense in depth: lean on the CLI/SDK's own adaptive retry in addition to our
-# explicit backoff below, in case throttling happens deeper inside a single call
-# (e.g. mid-pagination) than our retry loop can see.
-os.environ.setdefault("AWS_RETRY_MODE", "adaptive")
-os.environ.setdefault("AWS_MAX_ATTEMPTS", "10")
-
-
-def aws_json(args, max_attempts=8):
-    cmd = ["aws"] + args + ["--output", "json"]
-    for attempt in range(1, max_attempts + 1):
-        proc = subprocess.run(cmd, capture_output=True, text=True)
-        if proc.returncode == 0:
-            return json.loads(proc.stdout or "{}")
-        stderr = proc.stderr or ""
-        throttled = any(
-            marker in stderr
-            for marker in ("Throttling", "TooManyRequestsException", "RequestLimitExceeded")
-        )
-        if throttled and attempt < max_attempts:
-            time.sleep(min(2 ** attempt, 30) + random.uniform(0, 1))
-            continue
-        sys.stderr.write(stderr)
-        sys.exit(proc.returncode or 1)
-    return {}
-
-
-ou_parent = {}
-accounts = []
-
-
-def walk(parent_id):
-    for account in aws_json(["organizations", "list-accounts-for-parent", "--parent-id", parent_id]).get("Accounts", []):
-        accounts.append(
-            {
-                "id": account.get("Id"),
-                "name": account.get("Name"),
-                "arn": account.get("Arn"),
-                "parent_id": parent_id,
-            }
-        )
-    for ou in aws_json(["organizations", "list-organizational-units-for-parent", "--parent-id", parent_id]).get("OrganizationalUnits", []):
-        ou_id = ou.get("Id")
-        ou_parent[ou_id] = parent_id
-        walk(ou_id)
-
-
-def ancestor_chain(parent_id):
-    chain = [parent_id]
-    current = parent_id
-    while current in ou_parent:
-        current = ou_parent[current]
-        chain.append(current)
-    return chain
-
-
-for root in aws_json(["organizations", "list-roots"]).get("Roots", []):
-    walk(root.get("Id"))
-
-for account in accounts:
-    account["ancestor_ids"] = ancestor_chain(account["parent_id"])
-
-print(json.dumps({"accounts_json": json.dumps(accounts)}))
-PY
-SCRIPT
-  ]
+  lifecycle {
+    postcondition {
+      condition     = self.result.caller_account_id == data.aws_caller_identity.current.account_id
+      error_message = "Account discovery ran as AWS account ${self.result.caller_account_id}, but the Terraform AWS provider is authenticated as account ${data.aws_caller_identity.current.account_id}. These must be the same identity - check for a mismatch between your shell's AWS CLI credentials/profile and your Terraform provider configuration (for example, a provider assume_role block that this script's AWS CLI subprocess doesn't see)."
+    }
+  }
 }
 
 locals {
@@ -101,41 +30,25 @@ locals {
       ancestor_ids = try(account["ancestor_ids"], [])
     }
   ]
-}
 
-data "aws_organizations_resource_tags" "account_tags" {
-  for_each    = { for account in local.raw_accounts : account.id => account.arn }
-  resource_id = each.key
-}
-
-locals {
   management_account_id = data.aws_caller_identity.current.account_id
   organization_root_ids = [for root in data.aws_organizations_organization.org.roots : root.id]
   scoped_parent_ids     = length(var.target_parent_ids) > 0 ? var.target_parent_ids : local.organization_root_ids
-
-  account_tags_map = {
-    for account_id, tags_data in data.aws_organizations_resource_tags.account_tags :
-    account_id => try(tags_data.tags, {})
-  }
-
-  discovered_accounts = {
-    for account in local.raw_accounts :
-    account.id => {
-      id           = account.id
-      name         = account.name
-      arn          = account.arn
-      parent_id    = account.parent_id
-      ancestor_ids = account.ancestor_ids
-      tags         = lookup(local.account_tags_map, account.id, {})
-    }
-  }
+  is_organization_wide  = length(var.target_parent_ids) == 0
 
   # An account matches if ANY OU in its ancestor chain (immediate parent up through
   # the organization root) is in scope - so target_parent_ids selects accounts nested
   # at any depth beneath the given OU(s), not just its direct children.
+  #
+  # Tags are deliberately NOT fetched yet at this point - only once the candidate set
+  # is narrowed down by OU/include/exclude, and only if tag filtering is actually used
+  # (see account_tags_map below). Fetching tags for every account in the org regardless
+  # of scope means paying for organizations:ListTagsForResource on accounts nobody
+  # asked about, and one throttled/denied read anywhere in the whole org can fail the
+  # entire plan even when tag filtering is off.
   parent_filtered_accounts = {
-    for id, account in local.discovered_accounts :
-    id => account
+    for account in local.raw_accounts :
+    account.id => account
     if length(setintersection(toset(account.ancestor_ids), toset(local.scoped_parent_ids))) > 0
   }
 
@@ -148,12 +61,30 @@ locals {
     for id, account in local.include_filtered_accounts :
     id => account if !contains(var.exclude_account_ids, id)
   }
+}
 
+# Only created when tag filtering is actually configured, and only for the set of
+# accounts that already passed OU/include/exclude filtering - not the whole org.
+data "aws_organizations_resource_tags" "account_tags" {
+  for_each    = length(var.account_tag_filters) > 0 ? { for id, account in local.exclude_filtered_accounts : id => account.arn } : {}
+  resource_id = each.key
+}
+
+locals {
+  account_tags_map = {
+    for account_id, tags_data in data.aws_organizations_resource_tags.account_tags :
+    account_id => try(tags_data.tags, {})
+  }
+
+  # "" is reserved as the "tag not present" sentinel below, so a tag genuinely set to
+  # an empty string is treated the same as an absent tag - account_tag_filters rejects
+  # empty-string allowed values (see variables.tf) specifically so this can't be used
+  # to accidentally match accounts that don't actually have the tag.
   tag_filtered_accounts = length(var.account_tag_filters) == 0 ? local.exclude_filtered_accounts : {
     for id, account in local.exclude_filtered_accounts :
     id => account if alltrue([
       for tag_key, allowed_values in var.account_tag_filters :
-      contains(allowed_values, lookup(account.tags, tag_key, ""))
+      contains(allowed_values, lookup(lookup(local.account_tags_map, id, {}), tag_key, ""))
     ])
   }
 
@@ -195,7 +126,7 @@ locals {
 
   member_role_arns = {
     for account_id, _ in local.member_accounts :
-    account_id => "arn:aws:iam::${account_id}:role${var.role_path}${var.role_name}"
+    account_id => "arn:${data.aws_partition.current.partition}:iam::${account_id}:role${var.role_path}${var.role_name}"
   }
 
   stack_set_template_body = jsonencode({
@@ -213,7 +144,7 @@ locals {
             Statement = [local.drata_assume_role_statement]
           }
           ManagedPolicyArns = [
-            "arn:aws:iam::aws:policy/SecurityAudit"
+            "arn:${data.aws_partition.current.partition}:iam::aws:policy/SecurityAudit"
           ]
           Policies = [
             {
@@ -261,28 +192,6 @@ data "aws_iam_policy_document" "drata_autopilot_assume_role" {
   }
 }
 
-resource "aws_iam_policy" "drata_additional_permissions" {
-  count = var.include_management_account ? 1 : 0
-
-  name        = "DrataAdditionalPermissions"
-  description = "Custom policy for permissions in addition to the SecurityAudit policy"
-  path        = "/"
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Effect = "Allow"
-        Action = [
-          "backup:ListBackupJobs",
-          "backup:ListRecoveryPointsByResource"
-        ]
-        Resource = "*"
-      }
-    ]
-  })
-}
-
 resource "aws_iam_role" "management" {
   count = var.include_management_account ? 1 : 0
 
@@ -299,18 +208,35 @@ resource "aws_iam_role_policy_attachment" "management_security_audit" {
   count = var.include_management_account ? 1 : 0
 
   role       = aws_iam_role.management[0].name
-  policy_arn = "arn:aws:iam::aws:policy/SecurityAudit"
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/SecurityAudit"
 }
 
-resource "aws_iam_role_policy_attachment" "management_additional_permissions" {
+# Inline (not a separate customer-managed policy) to match the StackSet template's
+# member-account policy model, and to avoid a name collision with any pre-existing
+# customer-managed policy named "DrataAdditionalPermissions" in this account.
+resource "aws_iam_role_policy" "management_additional_permissions" {
   count = var.include_management_account ? 1 : 0
 
-  role       = aws_iam_role.management[0].name
-  policy_arn = aws_iam_policy.drata_additional_permissions[0].arn
+  name = "DrataAdditionalPermissions"
+  role = aws_iam_role.management[0].id
+
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect = "Allow"
+        Action = [
+          "backup:ListBackupJobs",
+          "backup:ListRecoveryPointsByResource"
+        ]
+        Resource = "*"
+      }
+    ]
+  })
 }
 
 # StackSet rolls the IAM role out to every selected member account. Requires trusted
-# access for CloudFormation StackSets (AWS Organizations).
+# access for CloudFormation StackSets (AWS Organizations) - see README prerequisites.
 resource "aws_cloudformation_stack_set" "member_role" {
   name             = local.stack_set_name
   permission_model = "SERVICE_MANAGED"
@@ -320,9 +246,9 @@ resource "aws_cloudformation_stack_set" "member_role" {
   # Required by AWS whenever permission_model = SERVICE_MANAGED (CreateStackSet
   # rejects the request otherwise: "AutoDeployment is required"). Disabled because
   # this module targets accounts explicitly via its own include/exclude/tag filters
-  # and per-account aws_cloudformation_stack_set_instance resources below - enabling
-  # AWS's native auto-deployment would let it silently expand the role to every
-  # account in a target OU, bypassing that scoping entirely.
+  # and the StackSet instance resource below - enabling AWS's native auto-deployment
+  # would let it silently expand the role to every account in a target OU, bypassing
+  # that scoping entirely.
   auto_deployment {
     enabled = false
   }
@@ -336,24 +262,49 @@ resource "aws_cloudformation_stack_set" "member_role" {
         data.aws_organizations_organization.org.aws_service_access_principals,
         "member.org.stacksets.cloudformation.amazonaws.com"
       )
-      error_message = "CloudFormation StackSets trusted access is not enabled for this AWS Organization. Enable it first (from the management account): aws organizations enable-aws-service-access --service-principal=member.org.stacksets.cloudformation.amazonaws.com"
+      error_message = "CloudFormation StackSets trusted access is not enabled for this AWS Organization. Enable it from the management account: either the CloudFormation console (StackSets -> Activate trusted access) or `aws organizations enable-aws-service-access --service-principal=member.org.stacksets.cloudformation.amazonaws.com`."
+    }
+
+    precondition {
+      # call_as = "SELF" above assumes Terraform is running as the org's actual
+      # management account (not a delegated administrator, which would need
+      # call_as = "DELEGATED_ADMIN" instead).
+      condition     = data.aws_caller_identity.current.account_id == data.aws_organizations_organization.org.master_account_id
+      error_message = "This module must be run from the AWS Organizations management account (${data.aws_organizations_organization.org.master_account_id}), but the current Terraform AWS provider identity is account ${data.aws_caller_identity.current.account_id}. Delegated-administrator execution is not currently supported by this module."
+    }
+
+    precondition {
+      # An empty target_parent_ids deploys to every account in the entire
+      # organization by design (see scoped_parent_ids) - require an explicit,
+      # deliberate opt-in rather than let that happen because a caller only set
+      # the required role_sts_externalid and nothing else.
+      condition     = !local.is_organization_wide || var.confirm_organization_wide_deployment
+      error_message = "target_parent_ids is empty, which deploys the role to every account in the entire AWS Organization. If that's intentional, set confirm_organization_wide_deployment = true. Otherwise, scope this with target_parent_ids to specific OUs/roots."
     }
   }
 }
 
-resource "aws_cloudformation_stack_set_instance" "member" {
-  for_each = local.member_accounts
+# A single StackSet instance resource targeting every selected member account at once,
+# rather than one resource per account. AWS generally serializes operations against a
+# single StackSet, so many per-account resources with Terraform's default parallelism
+# can collide with "OperationInProgressException" at scale; one resource means one
+# StackSet operation, using AWS's own concurrency controls (operation_preferences)
+# instead of Terraform's.
+resource "aws_cloudformation_stack_set_instance" "members" {
+  count = length(local.member_accounts) > 0 ? 1 : 0
 
   stack_set_name = aws_cloudformation_stack_set.member_role.name
   region         = local.effective_target_region
 
-  # AWS's documented pattern for targeting specific accounts under SERVICE_MANAGED
-  # never uses "accounts" alone - it pairs an OU/root with account_filter_type =
-  # INTERSECTION. Root always contains every account regardless of nesting depth,
-  # so this reliably resolves to exactly the one account in each.key.
   deployment_targets {
     organizational_unit_ids = [local.organization_root_ids[0]]
     account_filter_type     = "INTERSECTION"
-    accounts                = [each.key]
+    accounts                = keys(local.member_accounts)
+  }
+
+  operation_preferences {
+    max_concurrent_percentage    = 100
+    failure_tolerance_percentage = 10
+    concurrency_mode             = "SOFT_FAILURE_TOLERANCE"
   }
 }

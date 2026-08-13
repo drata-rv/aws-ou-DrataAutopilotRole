@@ -10,9 +10,28 @@ output "management_role_arn" {
 output "drata_role_arn" {
   value       = local.management_role_arn_output
   description = "Single ARN to provide to Drata for the AWS OU integration."
+
+  precondition {
+    # Drata's AWS OU connection expects a single management-account role ARN -
+    # include_management_account = false produces a null value here that can't
+    # be handed to Drata's setup flow, so fail at plan/apply time instead of
+    # silently returning null.
+    condition     = var.include_management_account
+    error_message = "drata_role_arn requires include_management_account = true - Drata's AWS OU integration is configured with a single management-account role ARN. Set include_management_account = true, or use member_role_arns directly if this deployment intentionally excludes the management account."
+  }
 }
 
 output "member_role_arns" {
   value       = local.member_role_arns
-  description = "Map of account ID to role ARN for each member account."
+  description = "Map of account ID to role ARN for each member account. Constructed deterministically from the account ID, role_path, and role_name (all of which are validated/fixed inputs) - not read back from the deployed StackSet instances."
+}
+
+output "resolved_member_account_ids" {
+  value       = sort(keys(local.member_accounts))
+  description = "Account IDs that will receive the StackSet-deployed role, after OU/include/exclude/tag filtering. Review this on every plan - especially with target_parent_ids left empty (organization-wide scope)."
+}
+
+output "resolved_member_account_count" {
+  value       = length(local.member_accounts)
+  description = "Count of resolved_member_account_ids. A 0 here with member accounts expected usually means an OU/tag/include filter didn't match what you intended - it does not error by itself, since 0 member accounts is a valid configuration when include_management_account = true and no member accounts are wanted."
 }
