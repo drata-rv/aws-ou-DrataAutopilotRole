@@ -161,7 +161,7 @@ terraform plan
 
 Look for:
 - The management account role (if `include_management_account = true`).
-- One module instance for each member account that passed your filters.
+- The `resolved_member_account_ids` output - this is the actual account list the single StackSet instance resource will target.
 - No unexpected accounts being targeted.
 
 ### Step 6 – Apply
@@ -209,7 +209,7 @@ You can supply variables three common ways:
    account_tag_filters     = { Environment = ["PROD", "SHARED"] }
    include_management_account = false
    ```
-   Terraform loads these automatically.
+   Terraform loads these automatically. Only works for variables you've declared at the root and wired into the module block (as `role_sts_externalid`/`target_parent_ids` are in the Step 2 example) - a `.tfvars` entry for anything else needs the same root `variable` + wiring added, or set it directly in the module block instead.
 3. **CLI flags** when running plan/apply:
    ```sh
    terraform apply -var='role_sts_externalid=abc123'
