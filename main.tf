@@ -10,7 +10,10 @@ data "aws_partition" "current" {}
 # provider no longer exposes a dedicated data source for this. See scripts/discover_accounts.py
 # for the full discovery logic (OU-tree walk, active-account filtering, retry/backoff).
 data "external" "organization_accounts" {
-  program = ["python3", "${path.module}/scripts/discover_accounts.py"]
+  # Absolute path, not "${path.module}/..." - some python3 builds (e.g. the
+  # python.org macOS installer) re-exec themselves through a launcher that
+  # doesn't reliably preserve cwd, breaking relative-path resolution.
+  program = ["python3", "${abspath(path.module)}/scripts/discover_accounts.py"]
 
   lifecycle {
     postcondition {
@@ -34,7 +37,9 @@ locals {
   management_account_id = data.aws_caller_identity.current.account_id
   organization_root_ids = [for root in data.aws_organizations_organization.org.roots : root.id]
   scoped_parent_ids     = length(var.target_parent_ids) > 0 ? var.target_parent_ids : local.organization_root_ids
-  is_organization_wide  = length(var.target_parent_ids) == 0
+  # An explicit include_account_ids allow-list is just as deliberate a scope as
+  # target_parent_ids - only treat this as "organization-wide" if NEITHER is set.
+  is_organization_wide = length(var.target_parent_ids) == 0 && length(var.include_account_ids) == 0
 
   # An account matches if ANY OU in its ancestor chain (immediate parent up through
   # the organization root) is in scope - so target_parent_ids selects accounts nested
