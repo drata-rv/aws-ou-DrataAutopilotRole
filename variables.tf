@@ -4,8 +4,8 @@ variable "drata_aws_account_arn" {
   description = "Drata's AWS account ARN"
 
   validation {
-    condition     = can(regex("^arn:aws[a-zA-Z-]*:iam::\\d{12}:root$", var.drata_aws_account_arn))
-    error_message = "drata_aws_account_arn must be an account root ARN of the form arn:aws:iam::<12-digit-account-id>:root."
+    condition     = can(regex("^arn:(aws|aws-cn|aws-us-gov|aws-iso|aws-iso-b):iam::\\d{12}:root$", var.drata_aws_account_arn))
+    error_message = "drata_aws_account_arn must be an account root ARN of the form arn:<partition>:iam::<12-digit-account-id>:root, with <partition> one of aws, aws-cn, aws-us-gov, aws-iso, aws-iso-b."
   }
 }
 
@@ -27,10 +27,13 @@ variable "role_name" {
   default     = "DrataAutopilotRole"
 
   validation {
-    # Intersection of IAM role naming rules and CloudFormation StackSet naming rules
-    # (stricter of the two) - the StackSet name is derived from this value.
-    condition     = can(regex("^[a-zA-Z][a-zA-Z0-9-]{0,127}$", var.role_name))
-    error_message = "role_name must start with a letter and contain only letters, digits, and hyphens (this becomes part of the CloudFormation StackSet name, which is stricter than IAM role naming rules)."
+    # IAM RoleName's real max is 64 chars (not CloudFormation StackSetName's 128) -
+    # role_name IS the RoleName directly, and even with the "-stackset" suffix added
+    # for the StackSet name, 64+9=73 stays well under CloudFormation's 128 limit. A
+    # longer-but-under-128 name previously passed this validation and only failed
+    # deep inside `apply` at the real IAM CreateRole call.
+    condition     = can(regex("^[a-zA-Z][a-zA-Z0-9-]{0,63}$", var.role_name))
+    error_message = "role_name must start with a letter, contain only letters/digits/hyphens, and be at most 64 characters (IAM's RoleName limit)."
   }
 }
 

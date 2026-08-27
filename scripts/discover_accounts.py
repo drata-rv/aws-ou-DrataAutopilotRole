@@ -36,11 +36,21 @@ def aws_json(args, max_attempts=8):
         if proc.returncode == 0:
             return json.loads(proc.stdout or "{}")
         stderr = proc.stderr or ""
-        throttled = any(
+        retryable = any(
             marker in stderr
-            for marker in ("Throttling", "TooManyRequestsException", "RequestLimitExceeded")
+            for marker in (
+                "Throttling",
+                "TooManyRequestsException",
+                "RequestLimitExceeded",
+                "ServiceUnavailable",
+                "InternalError",
+                "InternalFailure",
+                "Could not connect to the endpoint",
+                "Read timeout",
+                "Connection reset",
+            )
         )
-        if throttled and attempt < max_attempts:
+        if retryable and attempt < max_attempts:
             time.sleep(min(2 ** attempt, 30) + random.uniform(0, 1))
             continue
         sys.stderr.write(stderr)

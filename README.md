@@ -21,8 +21,8 @@ This guide walks through usage from a beginner’s perspective—no existing Ter
 
 Make sure you have:
 
-1. **Terraform CLI ≥ 1.3** (validated with 1.13.x) – download from [terraform.io/downloads](https://developer.hashicorp.com/terraform/downloads).
-2. **AWS provider 5.x** – the module pins `< 6.0` as a conservative compatibility bound; account enumeration itself is done via an `external` data source shelling out to the AWS CLI (not a native provider data source), since the AWS provider has never exposed one for listing Organizations accounts.
+1. **Terraform CLI ≥ 1.9** (validated with 1.13.x) – download from [terraform.io/downloads](https://developer.hashicorp.com/terraform/downloads). Cross-variable references inside a variable's own `validation` block (used to reject overlapping `include_account_ids`/`exclude_account_ids`) require 1.9+.
+2. **AWS provider 5.x** – the module pins `< 6.0` as a conservative compatibility bound. The AWS provider's `aws_organizations_organization` data source does list every account, but not each account's OU/parent - which OU-based filtering needs - so account discovery still shells out to the AWS CLI via an `external` data source.
 3. **AWS CLI** configured with credentials for the **management account**, using the *same* identity/profile your Terraform AWS provider block will use (a profile or environment variables that let you run `aws sts get-caller-identity` successfully).
 4. **Python 3.x** available in your shell (used by `scripts/discover_accounts.py`, the module's helper that enumerates accounts via the AWS CLI). Windows is untested - use WSL or a Linux/macOS runner.
 5. The management account permissions, matching what the module actually calls:
@@ -45,7 +45,11 @@ Follow these steps from an empty working directory.
 ```sh
 mkdir drata-autopilot-setup
 cd drata-autopilot-setup
+git init
+printf '*.tfvars\n*.tfvars.json\n.terraform/\n*.tfstate\n*.tfstate.*\n' > .gitignore
 ```
+
+That last step matters: your `terraform.tfvars` file (Step 3) will hold your Drata External ID in plaintext. Without a `.gitignore` in *this* new project directory specifically, a later `git add .` commits it - the module's own `.gitignore` doesn't extend to a project you create alongside it.
 
 ### Step 2 – Create `main.tf`
 
@@ -53,7 +57,7 @@ Paste the following, adjusting the module `source` path to wherever you unzipped
 
 ```hcl
 terraform {
-  required_version = ">= 1.3"
+  required_version = ">= 1.9"
 
   required_providers {
     aws = {
@@ -137,7 +141,7 @@ output "resolved_member_account_ids" {
 
 - Sign in to Drata → **Account Settings → Connections → AWS**.
 - Copy the **External ID** value.
-- Create a `terraform.tfvars` file (gitignored by default) next to this `main.tf`:
+- Create a `terraform.tfvars` file (gitignored by the `.gitignore` you just created) next to this `main.tf`:
   ```hcl
   role_sts_externalid = "paste-your-drata-external-id-here"
   target_parent_ids   = ["ou-ab12-cdef3456"] # or set confirm_organization_wide_deployment = true in the module block instead
@@ -161,7 +165,7 @@ terraform plan
 
 Look for:
 - The management account role (if `include_management_account = true`).
-- The `resolved_member_account_ids` output - this is the actual account list the single StackSet instance resource will target.
+- The `resolved_member_account_ids` output - this is the actual account list, one StackSet instance resource per account.
 - No unexpected accounts being targeted.
 
 ### Step 6 – Apply
@@ -186,6 +190,8 @@ If you already use Terraform:
 2. Ensure your root module defines the AWS provider (with the region of your choice).
 3. Decide how to pass `role_sts_externalid` and other variables (locals, `.tfvars`, etc.).
 4. Run `terraform init -upgrade` (if new module) and follow the usual plan/apply flow.
+
+A minimal, working root module is also in [`examples/basic`](examples/basic) if you'd rather start from a file than copy-paste this README.
 
 You can pin a released version via the Terraform Registry or a Git ref, e.g.
 
@@ -233,7 +239,7 @@ For sensitive values, consider `terraform.tfvars` combined with a `.gitignore`, 
 | `include_management_account` | bool | `true` | Create the role in the management account. Set to `false` if Drata should never assume into it - note this makes the `drata_role_arn` output fail its own precondition, since Drata's AWS OU integration expects a management-account role ARN. |
 | `target_region` | string | `null` | AWS region the CloudFormation StackSet instances are recorded/operated in (each instance is a regional resource, not just a naming detail). Defaults to the caller’s AWS provider region when omitted. |
 | `role_name` / `role_description` / `role_path` | string | Defaults in `variables.tf` | IAM metadata for the created role. `role_name` also derives the StackSet name, so it's restricted to letters/digits/hyphens starting with a letter. |
-| `tags` | map(string) | `{}` | Tags applied to the management-account IAM role and the StackSet resource. (Inline policies and the StackSet-deployed member-account role itself aren't taggable via this path.) |
+| `tags` | map(string) | `{}` | Tags applied to the management-account IAM role, the StackSet resource, and the member-account role deployed by the StackSet template. (The inline `DrataAdditionalPermissions` policy - management-account and member-account both - isn't taggable via this path.) |
 
 See `variables.tf` for any additional inputs.
 
@@ -255,7 +261,7 @@ Use `drata_role_arn` for Drata’s setup wizard. The remaining outputs help with
 1. Runs `scripts/discover_accounts.py` to walk the AWS Organizations OU tree (via the AWS CLI) and list every **active** account with its full OU ancestry.
 2. Applies OU, include/exclude, and tag filters (in that order) to determine the deployment set. Tags are only fetched for accounts that already passed the OU/include/exclude filters, and only if `account_tag_filters` is set - not for the whole organization.
 3. Optionally creates the IAM role in the management account.
-4. Creates a service-managed CloudFormation StackSet, then a single StackSet instance resource targeting every selected member account at once (not one resource per account - see Troubleshooting for why).
+4. Creates a service-managed CloudFormation StackSet, then one StackSet instance resource per selected member account. One resource per account, not one pooled resource for all of them, so that adding or removing a single account only touches that account's own resource - proved directly against the provider that a pooled resource forces a full destroy-and-recreate of every account's role on any membership change, which is a worse failure mode than what per-account resources trade for it (see the note on `OperationInProgressException` below).
 5. Returns ARNs and the resolved account list for Drata and for your own review.
 
 IAM permissions remain tightly scoped: the module only attaches the AWS managed `SecurityAudit` policy plus a short Drata-specific inline policy (`backup:ListBackupJobs`, `backup:ListRecoveryPointsByResource`).
@@ -263,6 +269,8 @@ IAM permissions remain tightly scoped: the module only attaches the AWS managed 
 **This module does not auto-reconcile.** New accounts, or accounts moved into a target OU after `apply`, are not deployed to until you run Terraform again - the StackSet's own `auto_deployment` is intentionally disabled so this module's OU/include/exclude/tag filtering (not AWS's) stays the source of truth. Re-run `terraform plan`/`apply` on whatever cadence matches how often your org structure changes.
 
 **Removing an account from scope removes its role.** If an account drops out of `target_parent_ids`/`include_account_ids`/`account_tag_filters`, or gets added to `exclude_account_ids`, the next `apply` deletes that account's StackSet instance (and the role with it) - the same as any other Terraform resource removed from desired state. Review `resolved_member_account_ids` in the plan output before applying a filter change on an existing deployment.
+
+**A large first-time apply can hit `OperationInProgressException`.** AWS allows only one operation in flight per StackSet at a time. Terraform applies the per-account StackSet instance resources with its default parallelism (multiple at once), so a first-time rollout to many accounts can have some of them collide and need a retry. Re-running `terraform apply` resolves it; for a very large initial rollout, `terraform apply -parallelism=1` (slower, but collision-free) is worth using for that first run.
 
 ---
 
@@ -272,7 +280,8 @@ IAM permissions remain tightly scoped: the module only attaches the AWS managed 
 - **"Account discovery ran as AWS account X, but the Terraform AWS provider is authenticated as account Y"** – your shell's AWS CLI credentials and your Terraform `provider "aws"` block are resolving to different identities (common if the provider block uses `assume_role`/a different profile than your default AWS CLI credentials). Point both at the same identity.
 - **"This module must be run from the AWS Organizations management account"** – this module doesn't support delegated-administrator execution; run it from the actual management account.
 - **"target_parent_ids is empty, which deploys the role to every account..."** – set `target_parent_ids`, or set `confirm_organization_wide_deployment = true` if that's genuinely what you want.
-- **StackSet instance failures** – confirm CloudFormation StackSets trusted access is enabled and review the StackSet operation detail for failed accounts (common causes are service control policies or pre-existing roles with the same name). Because this module uses a single StackSet instance resource for all accounts (see Section 7), a failure on one account is reported against that one resource - check the CloudFormation console for per-account detail.
+- **StackSet instance failures** – confirm CloudFormation StackSets trusted access is enabled and review the StackSet operation detail for failed accounts (common causes are service control policies or pre-existing roles with the same name). Each account has its own StackSet instance resource, so `terraform apply` output tells you exactly which account(s) failed.
+- **`Error: ... OperationInProgressException`** – expected on a large first-time apply (see Section 7); re-run `terraform apply`, or use `-parallelism=1` for that first run.
 - **Unexpected accounts targeted** – check the `resolved_member_account_ids` output. Adjust `target_parent_ids`, tag filters, or include/exclude lists accordingly. Remember `include_account_ids` only narrows an already-scoped set (see Section 5) — it will not add an account that falls outside `target_parent_ids`.
 - **Invalid value for variable errors on `terraform plan`** – account IDs must be 12-digit strings, OU IDs must look like `ou-xxxx-xxxxxxxx` (or `r-xxxx` for a root), `role_sts_externalid` must be set, and `account_tag_filters` values can't be an empty string. These are enforced by variable validation so mistakes surface immediately instead of silently matching zero accounts.
 - **Region concerns** – the module inherits the region from your provider block unless `target_region` is explicitly set. IAM itself is global, but each CloudFormation StackSet instance is a regional resource - `target_region` determines where those are recorded and operated, which affects where you'll look in the CloudFormation console to troubleshoot.
@@ -282,7 +291,7 @@ IAM permissions remain tightly scoped: the module only attaches the AWS managed 
 ## 9. Next Steps
 
 1. Keep the Drata External ID and IAM role name handy for Drata’s onboarding form.
-2. Store your Terraform state securely (consider remote state in S3 with locking if you adopt this in production).
+2. Store your Terraform state securely (consider remote state in S3 with locking if you adopt this in production). `role_sts_externalid` is marked `sensitive` so it won't appear in CLI/plan output, but Terraform still writes its actual value into state - state is where this module's confused-deputy protection actually lives, not just a place with "descriptive" data in it. Treat an unencrypted or overly-accessible state file as equivalent to leaking that ExternalId.
 3. Review the resulting IAM roles periodically to ensure the `tags`, `description`, and trust policy match your governance standards.
 4. Update to newer module releases as Drata requirements evolve.
 

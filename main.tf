@@ -6,9 +6,11 @@ data "aws_region" "current" {}
 
 data "aws_partition" "current" {}
 
-# External helper walks the AWS Organizations OU tree (via the AWS CLI) because the AWS
-# provider no longer exposes a dedicated data source for this. See scripts/discover_accounts.py
-# for the full discovery logic (OU-tree walk, active-account filtering, retry/backoff).
+# External helper walks the AWS Organizations OU tree (via the AWS CLI). The AWS provider's
+# aws_organizations_organization data source does list every account (accounts/non_master_accounts
+# attributes), but not each account's OU/parent - which target_parent_ids filtering needs - so this
+# still has to shell out. See scripts/discover_accounts.py for the full discovery logic (OU-tree
+# walk, active-account filtering, retry/backoff).
 data "external" "organization_accounts" {
   # Absolute path, not "${path.module}/..." - some python3 builds (e.g. the
   # python.org macOS installer) re-exec themselves through a launcher that
@@ -37,9 +39,15 @@ locals {
   management_account_id = data.aws_caller_identity.current.account_id
   organization_root_ids = [for root in data.aws_organizations_organization.org.roots : root.id]
   scoped_parent_ids     = length(var.target_parent_ids) > 0 ? var.target_parent_ids : local.organization_root_ids
-  # An explicit include_account_ids allow-list is just as deliberate a scope as
-  # target_parent_ids - only treat this as "organization-wide" if NEITHER is set.
-  is_organization_wide = length(var.target_parent_ids) == 0 && length(var.include_account_ids) == 0
+  # target_parent_ids, include_account_ids, and account_tag_filters are all equally
+  # deliberate ways to scope a deployment - only treat this as "organization-wide"
+  # if NONE of them narrow anything. exclude_account_ids alone does NOT count: it
+  # only removes accounts from an otherwise org-wide set, so it stays org-wide.
+  is_organization_wide = (
+    length(var.target_parent_ids) == 0 &&
+    length(var.include_account_ids) == 0 &&
+    length(var.account_tag_filters) == 0
+  )
 
   # An account matches if ANY OU in its ancestor chain (immediate parent up through
   # the organization root) is in scope - so target_parent_ids selects accounts nested
@@ -289,14 +297,23 @@ resource "aws_cloudformation_stack_set" "member_role" {
   }
 }
 
-# A single StackSet instance resource targeting every selected member account at once,
-# rather than one resource per account. AWS generally serializes operations against a
-# single StackSet, so many per-account resources with Terraform's default parallelism
-# can collide with "OperationInProgressException" at scale; one resource means one
-# StackSet operation, using AWS's own concurrency controls (operation_preferences)
-# instead of Terraform's.
-resource "aws_cloudformation_stack_set_instance" "members" {
-  count = length(local.member_accounts) > 0 ? 1 : 0
+# One resource per member account, not one pooled resource for all of them. Proved
+# directly against the pinned provider (synthetic prior state + `terraform plan
+# -refresh=false`) that deployment_targets.accounts is NOT declared force_new in the
+# JSON schema but DOES force a full replace in practice - so a single pooled resource
+# means every routine account add/remove destroys and recreates the StackSet instance
+# for EVERY account, not just the one that changed. Per-account resources give the
+# opposite, correct property: verified via the same synthetic-state technique that an
+# unrelated account's resource shows zero changes when a different account leaves scope.
+#
+# Trade-off accepted: AWS allows only one in-flight operation per StackSet, so Terraform
+# applying many of these concurrently (default parallelism) can hit
+# "OperationInProgressException" on a large first-time rollout - re-running `terraform
+# apply` (or a lower -parallelism on that first apply) resolves it. This is a real but
+# retriable failure mode, and a far smaller risk than nuking every account's role on
+# every routine membership change.
+resource "aws_cloudformation_stack_set_instance" "member" {
+  for_each = local.member_accounts
 
   stack_set_name = aws_cloudformation_stack_set.member_role.name
   region         = local.effective_target_region
@@ -304,12 +321,6 @@ resource "aws_cloudformation_stack_set_instance" "members" {
   deployment_targets {
     organizational_unit_ids = [local.organization_root_ids[0]]
     account_filter_type     = "INTERSECTION"
-    accounts                = keys(local.member_accounts)
-  }
-
-  operation_preferences {
-    max_concurrent_percentage    = 100
-    failure_tolerance_percentage = 10
-    concurrency_mode             = "SOFT_FAILURE_TOLERANCE"
+    accounts                = [each.key]
   }
 }
