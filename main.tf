@@ -318,6 +318,7 @@ resource "aws_cloudformation_stack_set_instance" "member" {
 
   stack_set_name = aws_cloudformation_stack_set.member_role.name
   region         = local.effective_target_region
+  call_as        = "SELF"
 
   deployment_targets {
     organizational_unit_ids = [local.organization_root_ids[0]]

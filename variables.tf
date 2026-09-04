@@ -147,9 +147,9 @@ variable "confirm_management_account_outside_filters" {
 }
 
 variable "minimum_member_account_count" {
-  description = "Minimum resolved member-account count required before deployment proceeds. Default 0 (no minimum) preserves configs that intentionally target zero member accounts (e.g. management-account-only deployments) - raise this for a production gate against a filter silently resolving to fewer accounts than expected."
+  description = "Minimum resolved member-account count required before deployment. Defaults to 1 so an empty selection fails instead of silently deploying to nobody. Set 0 only for an intentional management-account-only deployment."
   type        = number
-  default     = 0
+  default     = 1
 
   validation {
     condition     = var.minimum_member_account_count >= 0 && var.minimum_member_account_count == floor(var.minimum_member_account_count)
