@@ -10,7 +10,9 @@ children of a target OU. Only ACTIVE accounts are returned - suspended or
 pending-closure accounts can't receive new StackSet instances. Also reports
 the calling identity so Terraform can verify this script ran as the same
 AWS identity as the Terraform AWS provider itself (they can diverge if the
-provider uses assume_role/profile settings this subprocess doesn't see).
+provider uses assume_role/profile settings this subprocess doesn't see),
+and every root/OU ID actually seen while walking, so Terraform can reject
+a target_parent_ids entry that doesn't exist in this org.
 
 Reads no stdin. Emits a single JSON object on stdout, as required by
 Terraform's `external` data source (all top-level values must be strings).
@@ -60,9 +62,11 @@ def aws_json(args, max_attempts=8):
 
 ou_parent = {}
 accounts = []
+discovered_parent_ids = set()
 
 
 def walk(parent_id):
+    discovered_parent_ids.add(parent_id)
     for account in aws_json(["organizations", "list-accounts-for-parent", "--parent-id", parent_id]).get("Accounts", []):
         if account.get("Status") != "ACTIVE":
             continue
@@ -99,5 +103,9 @@ for account in accounts:
 
 print(json.dumps({
     "accounts_json": json.dumps(accounts),
+    # Every root/OU ID actually seen while walking, whether or not it has accounts -
+    # lets Terraform reject a target_parent_ids entry that's a real ID shape but
+    # doesn't exist in this org (a typo), instead of silently matching nothing.
+    "discovered_parent_ids_json": json.dumps(sorted(discovered_parent_ids)),
     "caller_account_id": caller_identity.get("Account", ""),
 }))

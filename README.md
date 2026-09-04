@@ -11,7 +11,7 @@ This guide walks through usage from a beginner’s perspective—no existing Ter
 > **Notes:**  
 > • If you received this module as a zipped package, unzip it somewhere convenient and reference the extracted folder in the `module "drata_autopilot_role"` block shown below.  
 > • Ensure CloudFormation StackSets has trusted access enabled with AWS Organizations before running Terraform - either via the CloudFormation console (**StackSets → Activate trusted access**) or `aws organizations enable-aws-service-access --service-principal=member.org.stacksets.cloudformation.amazonaws.com`.  
-> • The module shells out to the AWS CLI (via `scripts/discover_accounts.py`) to enumerate organization accounts, so Terraform must run in an environment where the CLI and Python 3 are installed and authenticated. **This must be the exact same AWS identity your Terraform AWS provider is configured with** - the module verifies this at plan time and fails with a clear error if they don't match (see Troubleshooting).  
+> • The module shells out to the AWS CLI (via `scripts/discover_accounts.py`) to enumerate organization accounts, so Terraform must run in an environment where the CLI and Python 3 are installed and authenticated. **The AWS CLI and your Terraform AWS provider must resolve to the same AWS account** (not necessarily the identical IAM principal/session - see Troubleshooting) - the module verifies this at plan time and fails with a clear error if they don't match.  
 > • Terraform must run **from the AWS Organizations management account itself** - delegated-administrator execution is not currently supported.  
 > • An empty `target_parent_ids` deploys the role to **every account in the entire organization**. The module requires `confirm_organization_wide_deployment = true` as an explicit opt-in if you actually want that; otherwise, set `target_parent_ids`.
 
@@ -237,8 +237,11 @@ For sensitive values, consider `terraform.tfvars` combined with a `.gitignore`, 
 | `include_account_ids` | list(string) | `[]` | Optional allow-list that **narrows** the set already scoped by `target_parent_ids`/`account_tag_filters` down to only these account IDs. This is an AND, not an OR — it cannot pull in an account from outside your OU/tag scope. |
 | `exclude_account_ids` | list(string) | `[]` | Remove specific accounts after other filters. Cannot overlap with `include_account_ids`. |
 | `include_management_account` | bool | `true` | Create the role in the management account. Set to `false` if Drata should never assume into it - note this makes the `drata_role_arn` output fail its own precondition, since Drata's AWS OU integration expects a management-account role ARN. |
+| `confirm_management_account_outside_filters` | bool | `false` | Required `true` if `include_management_account = true` and the management account itself doesn't match your OU/include/exclude/tag filters (the management-account role is created independent of those filters). No effect if it does match, or if `include_management_account = false`. |
+| `minimum_member_account_count` | number | `0` | Opt-in production gate: block deployment if the resolved member-account count is below this. `0` (default) enforces nothing, including the valid case of an intentional zero-member, management-account-only deployment. |
+| `expected_member_account_ids` | set(string) | `[]` | Opt-in production gate: when non-empty, the resolved member-account set must match this **exactly** or deployment is blocked - catches an OU move, tag change, or filter typo silently changing scope on a routine re-apply. Empty (default) means no exact-match check. |
 | `target_region` | string | `null` | AWS region the CloudFormation StackSet instances are recorded/operated in (each instance is a regional resource, not just a naming detail). Defaults to the caller’s AWS provider region when omitted. |
-| `role_name` / `role_description` / `role_path` | string | Defaults in `variables.tf` | IAM metadata for the created role. `role_name` also derives the StackSet name, so it's restricted to letters/digits/hyphens starting with a letter. |
+| `role_name` / `role_description` / `role_path` | string | Defaults in `variables.tf` | IAM metadata for the created role. `role_name` also derives the StackSet name, so it's restricted to letters/digits/hyphens starting with a letter, at most 64 characters (IAM's `RoleName` limit). |
 | `tags` | map(string) | `{}` | Tags applied to the management-account IAM role, the StackSet resource, and the member-account role deployed by the StackSet template. (The inline `DrataAdditionalPermissions` policy - management-account and member-account both - isn't taggable via this path.) |
 
 See `variables.tf` for any additional inputs.
@@ -250,7 +253,8 @@ See `variables.tf` for any additional inputs.
 - `drata_role_arn` – Single ARN to paste into Drata’s AWS OU connection (mirrors the management-account role; fails at plan time if `include_management_account = false`, since Drata's integration needs this to be non-null).
 - `management_role_arn` – ARN of the IAM role in the management account (or `null` if disabled).
 - `member_role_arns` – Map of `account_id => role_arn` for each targeted member account. Constructed deterministically from validated inputs, not read back from the deployed StackSet.
-- `resolved_member_account_ids` / `resolved_member_account_count` – The actual account set that filtering resolved to. **Check this on every plan**, especially with `target_parent_ids` left empty.
+- `resolved_member_account_ids` / `resolved_member_account_count` – The member-account set that filtering resolved to. **Check this on every plan**, especially with `target_parent_ids` left empty.
+- `all_role_account_ids` – Every account receiving the role, including the management account when `include_management_account = true`. The complete deployment footprint, not just the StackSet-managed subset.
 
 Use `drata_role_arn` for Drata’s setup wizard. The remaining outputs help with validation or additional automation.
 
@@ -258,9 +262,9 @@ Use `drata_role_arn` for Drata’s setup wizard. The remaining outputs help with
 
 ## 7. How the Module Works
 
-1. Runs `scripts/discover_accounts.py` to walk the AWS Organizations OU tree (via the AWS CLI) and list every **active** account with its full OU ancestry.
-2. Applies OU, include/exclude, and tag filters (in that order) to determine the deployment set. Tags are only fetched for accounts that already passed the OU/include/exclude filters, and only if `account_tag_filters` is set - not for the whole organization.
-3. Optionally creates the IAM role in the management account.
+1. Runs `scripts/discover_accounts.py` to walk the AWS Organizations OU tree (via the AWS CLI) and list every **active** account with its full OU ancestry, plus every root/OU ID actually seen (used to reject a `target_parent_ids` entry that doesn't exist in your org).
+2. Applies OU, include/exclude, and tag filters (in that order) to determine the deployment set. Tags are only fetched for accounts that already passed the OU/include/exclude filters, and only if `account_tag_filters` is set - not for the whole organization. Optionally checked against `minimum_member_account_count`/`expected_member_account_ids` if you've set those.
+3. Optionally creates the IAM role in the management account - independent of the filters above, so a `confirm_management_account_outside_filters` gate applies if the management account wouldn't otherwise match them.
 4. Creates a service-managed CloudFormation StackSet, then one StackSet instance resource per selected member account. One resource per account, not one pooled resource for all of them, so that adding or removing a single account only touches that account's own resource - proved directly against the provider that a pooled resource forces a full destroy-and-recreate of every account's role on any membership change, which is a worse failure mode than what per-account resources trade for it (see the note on `OperationInProgressException` below).
 5. Returns ARNs and the resolved account list for Drata and for your own review.
 
@@ -270,14 +274,17 @@ IAM permissions remain tightly scoped: the module only attaches the AWS managed 
 
 **Removing an account from scope removes its role.** If an account drops out of `target_parent_ids`/`include_account_ids`/`account_tag_filters`, or gets added to `exclude_account_ids`, the next `apply` deletes that account's StackSet instance (and the role with it) - the same as any other Terraform resource removed from desired state. Review `resolved_member_account_ids` in the plan output before applying a filter change on an existing deployment.
 
-**A large first-time apply can hit `OperationInProgressException`.** AWS allows only one operation in flight per StackSet at a time. Terraform applies the per-account StackSet instance resources with its default parallelism (multiple at once), so a first-time rollout to many accounts can have some of them collide and need a retry. Re-running `terraform apply` resolves it; for a very large initial rollout, `terraform apply -parallelism=1` (slower, but collision-free) is worth using for that first run.
+**A large first-time apply can hit `OperationInProgressException`.** AWS allows only one operation in flight per StackSet at a time. Terraform applies the per-account StackSet instance resources with its default parallelism (multiple at once), so a first-time rollout to many accounts can have some of them collide and need a retry. The StackSet has `managed_execution.active = true`, which has AWS itself queue colliding operations instead of rejecting them outright - this helps, but re-running `terraform apply` (or using `terraform apply -parallelism=1` for that first run, slower but collision-free) is still the reliable fix if you hit this.
 
 ---
 
 ## 8. Troubleshooting Tips
 
 - **AccessDenied when listing accounts** – confirm your management-account credentials have the Organizations permissions listed in the prerequisites.
-- **"Account discovery ran as AWS account X, but the Terraform AWS provider is authenticated as account Y"** – your shell's AWS CLI credentials and your Terraform `provider "aws"` block are resolving to different identities (common if the provider block uses `assume_role`/a different profile than your default AWS CLI credentials). Point both at the same identity.
+- **"Account discovery ran as AWS account X, but the Terraform AWS provider is authenticated as account Y"** – your shell's AWS CLI credentials and your Terraform `provider "aws"` block are resolving to different **accounts** (common if the provider block uses `assume_role`/a different profile than your default AWS CLI credentials). This check only requires the same account, not the same IAM principal or STS session - point both at the management account and it's satisfied.
+- **"target_parent_ids contains an ID that doesn't exist in this AWS Organization"** – the ID matches the expected `ou-xxxx-xxxxxxxx`/`r-xxxx` shape but isn't a real root/OU in your org (usually a typo). Check it against the AWS Organizations console.
+- **"include_management_account = true creates the role in the management account... and this account doesn't match those filters"** – the management-account role is created independent of `target_parent_ids`/`include_account_ids`/`exclude_account_ids`/`account_tag_filters` whenever `include_management_account = true`. If the management account wouldn't have matched those filters on its own, set `confirm_management_account_outside_filters = true` to acknowledge that's intentional.
+- **"Resolved N member account(s), below the required minimum"** / **"doesn't exactly match expected_member_account_ids"** – opt-in gates (`minimum_member_account_count`, `expected_member_account_ids`, both default off) for when you want a filter change to require explicit re-approval rather than silently taking effect. See Section 5.
 - **"This module must be run from the AWS Organizations management account"** – this module doesn't support delegated-administrator execution; run it from the actual management account.
 - **"target_parent_ids is empty, which deploys the role to every account..."** – set `target_parent_ids`, or set `confirm_organization_wide_deployment = true` if that's genuinely what you want.
 - **StackSet instance failures** – confirm CloudFormation StackSets trusted access is enabled and review the StackSet operation detail for failed accounts (common causes are service control policies or pre-existing roles with the same name). Each account has its own StackSet instance resource, so `terraform apply` output tells you exactly which account(s) failed.
@@ -295,4 +302,19 @@ IAM permissions remain tightly scoped: the module only attaches the AWS managed 
 3. Review the resulting IAM roles periodically to ensure the `tags`, `description`, and trust policy match your governance standards.
 4. Update to newer module releases as Drata requirements evolve.
 
-With these steps, you can deploy the Drata Autopilot role across an AWS Organization confidently and repeatably. Happy automating!
+With these steps, you can deploy the Drata Autopilot role across an AWS Organization confidently and repeatably.
+
+---
+
+## 10. Before a Large or Production Rollout
+
+The module works the same at any scale, but a first deployment across many accounts is worth extra care:
+
+- **Check for existing resources first.** If any target account already has a role named `role_name` (or a StackSet named `${role_name}-stackset`) from a prior manual setup or an earlier version of this module, `apply` will fail on a naming collision, not silently adopt it. Inventory before your first run if you're not certain the org is clean.
+- **Use `expected_member_account_ids` as an approval gate.** Set it to the exact account list you've reviewed and approved. Any subsequent OU move, tag change, or filter typo that would change the resolved set is then a hard block instead of a silent scope change - review `all_role_account_ids` in the plan, update `expected_member_account_ids` deliberately, then apply.
+- **Run a canary first.** Point `target_parent_ids` at a small test OU (one direct account, one nested account is enough to prove OU-depth matching) before scoping to your full organization. Confirm the role, trust policy, and policies look right, and that a second `plan` afterward reports no changes.
+- **Consider `-parallelism=1` for the first large apply.** See the `OperationInProgressException` note in Section 7 - `managed_execution` on the StackSet helps, but a lower parallelism removes the risk entirely for that first run.
+- **Verify Drata's actual current requirements before trusting this module's defaults.** `drata_aws_account_arn`'s default and the granted permissions are believed correct as of when this module was last updated - confirm against your live Drata AWS connection setup rather than assuming.
+- **Pin your root config's provider versions exactly** (not just within this module's `>=5.0,<6.0` range) and commit that root config's own `.terraform.lock.hcl` - this module intentionally does not ship one, since a reusable module locking its own provider versions would force that pin onto every consumer regardless of their own root configuration.
+
+Happy automating!

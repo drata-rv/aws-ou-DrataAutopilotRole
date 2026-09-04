@@ -20,7 +20,16 @@ data "external" "organization_accounts" {
   lifecycle {
     postcondition {
       condition     = self.result.caller_account_id == data.aws_caller_identity.current.account_id
-      error_message = "Account discovery ran as AWS account ${self.result.caller_account_id}, but the Terraform AWS provider is authenticated as account ${data.aws_caller_identity.current.account_id}. These must be the same identity - check for a mismatch between your shell's AWS CLI credentials/profile and your Terraform provider configuration (for example, a provider assume_role block that this script's AWS CLI subprocess doesn't see)."
+      error_message = "Account discovery ran as AWS account ${self.result.caller_account_id}, but the Terraform AWS provider is authenticated as account ${data.aws_caller_identity.current.account_id}. These must be the same AWS account - check for a mismatch between your shell's AWS CLI credentials/profile and your Terraform provider configuration (for example, a provider assume_role block that this script's AWS CLI subprocess doesn't see)."
+    }
+
+    postcondition {
+      # Confirms every target_parent_ids entry is a real root/OU in this org, not
+      # just a well-formed-looking ID (a typo like "ou-ab12-11119999" instead of
+      # "ou-ab12-11119998" passes the format regex and silently matches zero
+      # accounts otherwise).
+      condition     = length(setsubtract(toset(var.target_parent_ids), toset(try(jsondecode(self.result.discovered_parent_ids_json), [])))) == 0
+      error_message = "target_parent_ids contains an ID that doesn't exist in this AWS Organization: ${join(", ", setsubtract(toset(var.target_parent_ids), toset(try(jsondecode(self.result.discovered_parent_ids_json), []))))}. Double-check the OU/root ID against AWS Organizations."
     }
   }
 }
@@ -108,6 +117,12 @@ locals {
     for id, account in local.tag_filtered_accounts :
     id => account if id != local.management_account_id
   }
+
+  # Whether the management account would ALSO have matched the OU/include/exclude/tag
+  # filters on its own - i.e. whether include_management_account is just confirming
+  # what filtering already implies, versus adding the role somewhere those filters
+  # don't otherwise reach.
+  management_account_matches_filters = contains(keys(local.tag_filtered_accounts), local.management_account_id)
 
   effective_target_region = coalesce(var.target_region, data.aws_region.current.name)
 
@@ -266,6 +281,14 @@ resource "aws_cloudformation_stack_set" "member_role" {
     enabled = false
   }
 
+  # Queues/serializes StackSet operations at the AWS level - a real mitigation for
+  # the OperationInProgressException trade-off documented below on the per-account
+  # instance resources, on top of (not a replacement for) applying with a lower
+  # -parallelism on a large first-time rollout.
+  managed_execution {
+    active = true
+  }
+
   template_body = local.stack_set_template_body
   tags          = var.tags
 
@@ -293,6 +316,34 @@ resource "aws_cloudformation_stack_set" "member_role" {
       # the required role_sts_externalid and nothing else.
       condition     = !local.is_organization_wide || var.confirm_organization_wide_deployment
       error_message = "target_parent_ids is empty, which deploys the role to every account in the entire AWS Organization. If that's intentional, set confirm_organization_wide_deployment = true. Otherwise, scope this with target_parent_ids to specific OUs/roots."
+    }
+
+    precondition {
+      # include_management_account creates the management-account role unconditionally,
+      # independent of target_parent_ids/include_account_ids/exclude_account_ids/
+      # account_tag_filters - require an explicit acknowledgment when the management
+      # account wouldn't otherwise have matched those filters on its own.
+      condition     = !var.include_management_account || local.management_account_matches_filters || var.confirm_management_account_outside_filters
+      error_message = "include_management_account = true creates the role in the management account (${local.management_account_id}) regardless of target_parent_ids/include_account_ids/exclude_account_ids/account_tag_filters, and this account doesn't match those filters. If that's intentional (Drata's integration needs a management-account role as a control-plane exception), set confirm_management_account_outside_filters = true."
+    }
+
+    precondition {
+      condition     = length(local.member_accounts) >= var.minimum_member_account_count
+      error_message = "Resolved ${length(local.member_accounts)} member account(s), below the required minimum of ${var.minimum_member_account_count} (minimum_member_account_count). Check resolved_member_account_ids - this usually means a filter didn't match what you intended."
+    }
+
+    precondition {
+      # Opt-in exact-match gate: when set, the resolved member-account set must be
+      # EXACTLY expected_member_account_ids - no more, no fewer. Catches an OU move,
+      # a tag change, or a typo'd filter silently changing scope on a routine re-apply.
+      condition = (
+        length(var.expected_member_account_ids) == 0 ||
+        length(setsubtract(toset(keys(local.member_accounts)), var.expected_member_account_ids)) == 0
+        ) && (
+        length(var.expected_member_account_ids) == 0 ||
+        length(setsubtract(var.expected_member_account_ids, toset(keys(local.member_accounts)))) == 0
+      )
+      error_message = "Resolved member-account set doesn't exactly match expected_member_account_ids. Unexpected: ${join(", ", setsubtract(toset(keys(local.member_accounts)), var.expected_member_account_ids))}. Missing: ${join(", ", setsubtract(var.expected_member_account_ids, toset(keys(local.member_accounts))))}."
     }
   }
 }

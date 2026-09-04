@@ -35,3 +35,8 @@ output "resolved_member_account_count" {
   value       = length(local.member_accounts)
   description = "Count of resolved_member_account_ids. A 0 here with member accounts expected usually means an OU/tag/include filter didn't match what you intended - it does not error by itself, since 0 member accounts is a valid configuration when include_management_account = true and no member accounts are wanted."
 }
+
+output "all_role_account_ids" {
+  value       = sort(concat(keys(local.member_accounts), var.include_management_account ? [local.management_account_id] : []))
+  description = "Every account that receives the role, including the management account when include_management_account = true. Use this (not resolved_member_account_ids alone) to review the complete deployment footprint."
+}

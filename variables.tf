@@ -143,3 +143,31 @@ variable "confirm_organization_wide_deployment" {
   type        = bool
   default     = false
 }
+
+variable "confirm_management_account_outside_filters" {
+  description = "Required explicit opt-in if include_management_account = true and the management account itself doesn't match target_parent_ids/include_account_ids/exclude_account_ids/account_tag_filters. Has no effect when include_management_account = false, or when the management account matches those filters anyway."
+  type        = bool
+  default     = false
+}
+
+variable "minimum_member_account_count" {
+  description = "Minimum resolved member-account count required before deployment proceeds. Default 0 (no minimum) preserves configs that intentionally target zero member accounts (e.g. management-account-only deployments) - raise this for a production gate against a filter silently resolving to fewer accounts than expected."
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.minimum_member_account_count >= 0 && var.minimum_member_account_count == floor(var.minimum_member_account_count)
+    error_message = "minimum_member_account_count must be a non-negative integer."
+  }
+}
+
+variable "expected_member_account_ids" {
+  description = "Optional exact expected member-account set. When non-empty, the resolved member-account set must match this exactly (no more, no fewer) or deployment is blocked - a production gate against an OU move, tag change, or filter typo silently changing scope on a routine re-apply. Leave empty (default) to allow the filters to resolve dynamically with no exact-match check."
+  type        = set(string)
+  default     = []
+
+  validation {
+    condition     = alltrue([for id in var.expected_member_account_ids : can(regex("^\\d{12}$", id))])
+    error_message = "Each entry in expected_member_account_ids must be a 12-digit AWS account ID string (e.g. \"123456789012\")."
+  }
+}
