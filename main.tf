@@ -6,15 +6,11 @@ data "aws_region" "current" {}
 
 data "aws_partition" "current" {}
 
-# External helper walks the AWS Organizations OU tree (via the AWS CLI). The AWS provider's
-# aws_organizations_organization data source does list every account (accounts/non_master_accounts
-# attributes), but not each account's OU/parent - which target_parent_ids filtering needs - so this
-# still has to shell out. See scripts/discover_accounts.py for the full discovery logic (OU-tree
-# walk, active-account filtering, retry/backoff).
+# aws_organizations_organization lists accounts but not their OU/parent, so OU-based
+# filtering still needs the CLI walk in scripts/discover_accounts.py.
 data "external" "organization_accounts" {
-  # Absolute path, not "${path.module}/..." - some python3 builds (e.g. the
-  # python.org macOS installer) re-exec themselves through a launcher that
-  # doesn't reliably preserve cwd, breaking relative-path resolution.
+  # Absolute path: some python3 builds (python.org macOS installer) don't preserve
+  # cwd on relaunch, breaking relative paths.
   program = ["python3", "${abspath(path.module)}/scripts/discover_accounts.py"]
 
   lifecycle {
@@ -24,10 +20,7 @@ data "external" "organization_accounts" {
     }
 
     postcondition {
-      # Confirms every target_parent_ids entry is a real root/OU in this org, not
-      # just a well-formed-looking ID (a typo like "ou-ab12-11119999" instead of
-      # "ou-ab12-11119998" passes the format regex and silently matches zero
-      # accounts otherwise).
+      # Rejects a well-formed but nonexistent target_parent_ids entry (typo).
       condition     = length(setsubtract(toset(var.target_parent_ids), toset(try(jsondecode(self.result.discovered_parent_ids_json), [])))) == 0
       error_message = "target_parent_ids contains an ID that doesn't exist in this AWS Organization: ${join(", ", setsubtract(toset(var.target_parent_ids), toset(try(jsondecode(self.result.discovered_parent_ids_json), []))))}. Double-check the OU/root ID against AWS Organizations."
     }
@@ -48,26 +41,17 @@ locals {
   management_account_id = data.aws_caller_identity.current.account_id
   organization_root_ids = [for root in data.aws_organizations_organization.org.roots : root.id]
   scoped_parent_ids     = length(var.target_parent_ids) > 0 ? var.target_parent_ids : local.organization_root_ids
-  # target_parent_ids, include_account_ids, and account_tag_filters are all equally
-  # deliberate ways to scope a deployment - only treat this as "organization-wide"
-  # if NONE of them narrow anything. exclude_account_ids alone does NOT count: it
-  # only removes accounts from an otherwise org-wide set, so it stays org-wide.
+  # target_parent_ids / include_account_ids / account_tag_filters each count as
+  # deliberate scoping; only "organization-wide" if none of them narrow anything.
+  # exclude_account_ids alone doesn't count - it only removes from an org-wide set.
   is_organization_wide = (
     length(var.target_parent_ids) == 0 &&
     length(var.include_account_ids) == 0 &&
     length(var.account_tag_filters) == 0
   )
 
-  # An account matches if ANY OU in its ancestor chain (immediate parent up through
-  # the organization root) is in scope - so target_parent_ids selects accounts nested
-  # at any depth beneath the given OU(s), not just its direct children.
-  #
-  # Tags are deliberately NOT fetched yet at this point - only once the candidate set
-  # is narrowed down by OU/include/exclude, and only if tag filtering is actually used
-  # (see account_tags_map below). Fetching tags for every account in the org regardless
-  # of scope means paying for organizations:ListTagsForResource on accounts nobody
-  # asked about, and one throttled/denied read anywhere in the whole org can fail the
-  # entire plan even when tag filtering is off.
+  # Matches on any ancestor OU, not just direct parent, so target_parent_ids selects
+  # accounts nested at any depth.
   parent_filtered_accounts = {
     for account in local.raw_accounts :
     account.id => account
@@ -85,8 +69,8 @@ locals {
   }
 }
 
-# Only created when tag filtering is actually configured, and only for the set of
-# accounts that already passed OU/include/exclude filtering - not the whole org.
+# Tags fetched only for the OU/include/exclude-narrowed set, and only if
+# account_tag_filters is set - not for every account in the org.
 data "aws_organizations_resource_tags" "account_tags" {
   for_each    = length(var.account_tag_filters) > 0 ? { for id, account in local.exclude_filtered_accounts : id => account.arn } : {}
   resource_id = each.key
@@ -98,10 +82,8 @@ locals {
     account_id => try(tags_data.tags, {})
   }
 
-  # "" is reserved as the "tag not present" sentinel below, so a tag genuinely set to
-  # an empty string is treated the same as an absent tag - account_tag_filters rejects
-  # empty-string allowed values (see variables.tf) specifically so this can't be used
-  # to accidentally match accounts that don't actually have the tag.
+  # "" means "tag not present" below; account_tag_filters rejects "" as an allowed
+  # value so it can't be used to match accounts that lack the tag.
   tag_filtered_accounts = length(var.account_tag_filters) == 0 ? local.exclude_filtered_accounts : {
     for id, account in local.exclude_filtered_accounts :
     id => account if alltrue([
@@ -110,18 +92,15 @@ locals {
     ])
   }
 
-  # The management account never receives its role via the StackSet path - it's
-  # provisioned separately below (aws_iam_role.management), gated by the same
-  # var.include_management_account - so it's always excluded here regardless.
+  # Management account always gets its role via aws_iam_role.management below, never
+  # via the StackSet path.
   member_accounts = {
     for id, account in local.tag_filtered_accounts :
     id => account if id != local.management_account_id
   }
 
-  # Whether the management account would ALSO have matched the OU/include/exclude/tag
-  # filters on its own - i.e. whether include_management_account is just confirming
-  # what filtering already implies, versus adding the role somewhere those filters
-  # don't otherwise reach.
+  # Whether the management account would also match the OU/include/exclude/tag filters
+  # on its own.
   management_account_matches_filters = contains(keys(local.tag_filtered_accounts), local.management_account_id)
 
   effective_target_region = coalesce(var.target_region, data.aws_region.current.name)
@@ -239,9 +218,8 @@ resource "aws_iam_role_policy_attachment" "management_security_audit" {
   policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/SecurityAudit"
 }
 
-# Inline (not a separate customer-managed policy) to match the StackSet template's
-# member-account policy model, and to avoid a name collision with any pre-existing
-# customer-managed policy named "DrataAdditionalPermissions" in this account.
+# Inline, not a customer-managed policy, to avoid a name collision with any
+# pre-existing policy named "DrataAdditionalPermissions" in this account.
 resource "aws_iam_role_policy" "management_additional_permissions" {
   count = var.include_management_account ? 1 : 0
 
@@ -263,28 +241,21 @@ resource "aws_iam_role_policy" "management_additional_permissions" {
   })
 }
 
-# StackSet rolls the IAM role out to every selected member account. Requires trusted
-# access for CloudFormation StackSets (AWS Organizations) - see README prerequisites.
+# Requires CloudFormation StackSets trusted access with AWS Organizations - see README.
 resource "aws_cloudformation_stack_set" "member_role" {
   name             = local.stack_set_name
   permission_model = "SERVICE_MANAGED"
   capabilities     = ["CAPABILITY_NAMED_IAM"]
   call_as          = "SELF"
 
-  # Required by AWS whenever permission_model = SERVICE_MANAGED (CreateStackSet
-  # rejects the request otherwise: "AutoDeployment is required"). Disabled because
-  # this module targets accounts explicitly via its own include/exclude/tag filters
-  # and the StackSet instance resource below - enabling AWS's native auto-deployment
-  # would let it silently expand the role to every account in a target OU, bypassing
-  # that scoping entirely.
+  # Required by AWS for permission_model = SERVICE_MANAGED. Disabled: accounts are
+  # targeted explicitly via this module's own filters, not AWS's OU auto-deployment.
   auto_deployment {
     enabled = false
   }
 
-  # Queues/serializes StackSet operations at the AWS level - a real mitigation for
-  # the OperationInProgressException trade-off documented below on the per-account
-  # instance resources, on top of (not a replacement for) applying with a lower
-  # -parallelism on a large first-time rollout.
+  # Queues colliding StackSet operations instead of rejecting them; mitigates
+  # OperationInProgressException (see note on the instance resource below).
   managed_execution {
     active = true
   }
@@ -302,27 +273,17 @@ resource "aws_cloudformation_stack_set" "member_role" {
     }
 
     precondition {
-      # call_as = "SELF" above assumes Terraform is running as the org's actual
-      # management account (not a delegated administrator, which would need
-      # call_as = "DELEGATED_ADMIN" instead).
+      # call_as = "SELF" requires the actual management account, not a delegated admin.
       condition     = data.aws_caller_identity.current.account_id == data.aws_organizations_organization.org.master_account_id
       error_message = "This module must be run from the AWS Organizations management account (${data.aws_organizations_organization.org.master_account_id}), but the current Terraform AWS provider identity is account ${data.aws_caller_identity.current.account_id}. Delegated-administrator execution is not currently supported by this module."
     }
 
     precondition {
-      # An empty target_parent_ids deploys to every account in the entire
-      # organization by design (see scoped_parent_ids) - require an explicit,
-      # deliberate opt-in rather than let that happen because a caller only set
-      # the required role_sts_externalid and nothing else.
       condition     = !local.is_organization_wide || var.confirm_organization_wide_deployment
       error_message = "target_parent_ids is empty, which deploys the role to every account in the entire AWS Organization. If that's intentional, set confirm_organization_wide_deployment = true. Otherwise, scope this with target_parent_ids to specific OUs/roots."
     }
 
     precondition {
-      # include_management_account creates the management-account role unconditionally,
-      # independent of target_parent_ids/include_account_ids/exclude_account_ids/
-      # account_tag_filters - require an explicit acknowledgment when the management
-      # account wouldn't otherwise have matched those filters on its own.
       condition     = !var.include_management_account || local.management_account_matches_filters || var.confirm_management_account_outside_filters
       error_message = "include_management_account = true creates the role in the management account (${local.management_account_id}) regardless of target_parent_ids/include_account_ids/exclude_account_ids/account_tag_filters, and this account doesn't match those filters. If that's intentional (Drata's integration needs a management-account role as a control-plane exception), set confirm_management_account_outside_filters = true."
     }
@@ -333,9 +294,6 @@ resource "aws_cloudformation_stack_set" "member_role" {
     }
 
     precondition {
-      # Opt-in exact-match gate: when set, the resolved member-account set must be
-      # EXACTLY expected_member_account_ids - no more, no fewer. Catches an OU move,
-      # a tag change, or a typo'd filter silently changing scope on a routine re-apply.
       condition = (
         length(var.expected_member_account_ids) == 0 ||
         length(setsubtract(toset(keys(local.member_accounts)), var.expected_member_account_ids)) == 0
@@ -348,21 +306,13 @@ resource "aws_cloudformation_stack_set" "member_role" {
   }
 }
 
-# One resource per member account, not one pooled resource for all of them. Proved
-# directly against the pinned provider (synthetic prior state + `terraform plan
-# -refresh=false`) that deployment_targets.accounts is NOT declared force_new in the
-# JSON schema but DOES force a full replace in practice - so a single pooled resource
-# means every routine account add/remove destroys and recreates the StackSet instance
-# for EVERY account, not just the one that changed. Per-account resources give the
-# opposite, correct property: verified via the same synthetic-state technique that an
-# unrelated account's resource shows zero changes when a different account leaves scope.
-#
-# Trade-off accepted: AWS allows only one in-flight operation per StackSet, so Terraform
-# applying many of these concurrently (default parallelism) can hit
-# "OperationInProgressException" on a large first-time rollout - re-running `terraform
-# apply` (or a lower -parallelism on that first apply) resolves it. This is a real but
-# retriable failure mode, and a far smaller risk than nuking every account's role on
-# every routine membership change.
+# One resource per account, not one pooled resource for all accounts: changing
+# deployment_targets.accounts forces a full replace, so pooling would destroy and
+# recreate every account's role on any single membership change. Per-account isolates
+# that to just the account that changed.
+# Trade-off: AWS allows only one in-flight operation per StackSet, so applying many of
+# these concurrently can hit OperationInProgressException on a large first-time
+# rollout - retriable, and a smaller risk than the pooled-resource blast radius.
 resource "aws_cloudformation_stack_set_instance" "member" {
   for_each = local.member_accounts
 

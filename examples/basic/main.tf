@@ -15,8 +15,7 @@ terraform {
 
 provider "aws" {
   region = "us-east-1" # pick any region; IAM itself is global
-  # Must resolve to the SAME AWS identity as the AWS CLI in this environment -
-  # the module verifies this at plan time and fails clearly if they diverge.
+  # Must resolve to the same AWS account as the AWS CLI in this environment.
 }
 
 variable "role_sts_externalid" {

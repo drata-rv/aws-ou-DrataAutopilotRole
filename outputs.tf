@@ -12,10 +12,7 @@ output "drata_role_arn" {
   description = "Single ARN to provide to Drata for the AWS OU integration."
 
   precondition {
-    # Drata's AWS OU connection expects a single management-account role ARN -
-    # include_management_account = false produces a null value here that can't
-    # be handed to Drata's setup flow, so fail at plan/apply time instead of
-    # silently returning null.
+    # Drata's AWS OU connection needs a non-null management-account role ARN here.
     condition     = var.include_management_account
     error_message = "drata_role_arn requires include_management_account = true - Drata's AWS OU integration is configured with a single management-account role ARN. Set include_management_account = true, or use member_role_arns directly if this deployment intentionally excludes the management account."
   }
